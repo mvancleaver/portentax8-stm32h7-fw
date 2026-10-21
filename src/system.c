@@ -214,12 +214,16 @@ int get_available_enqueue()
   __set_PRIMASK(1) ;
 
   struct complete_packet * pkt = (struct complete_packet *)p_tx_buf_active;
-  int const num_bytes_available = (SPI_DMA_BUFFER_SIZE - 4) - pkt->header.size;
+  /* 07.4.42.2 REVIEW WR-04: payload bytes the NEXT enqueue_packet() can take,
+   * i.e. net of its 4-byte subpacket header (callers compare this against the
+   * payload size they are about to enqueue). Clamped at 0. */
+  int const num_bytes_available = (SPI_DMA_BUFFER_SIZE - 4) - (int)pkt->header.size
+                                  - (int)sizeof(((struct subpacket *)0)->header);
 
   /* Exit critical section: restore previous priority mask */
   __set_PRIMASK(primask_bit);
 
-  return num_bytes_available;
+  return num_bytes_available > 0 ? num_bytes_available : 0;
 }
 
 int enqueue_packet(uint8_t const peripheral, uint8_t const opcode, uint16_t const size, void * data)
@@ -248,7 +252,12 @@ int enqueue_packet(uint8_t const peripheral, uint8_t const opcode, uint16_t cons
    * - uint16_t checksum;  | sizeof(complete_packet.header) = 4 Bytes
    */
   struct complete_packet * pkt = (struct complete_packet *)p_tx_buf_active;
-  if ((pkt->header.size + size) > (SPI_DMA_BUFFER_SIZE - 4))
+  struct subpacket subpkt;
+  /* 07.4.42.2 REVIEW WR-04: the subpacket written below is its 4-byte header
+   * plus `size` payload bytes; the bound used to omit the header, so a packet
+   * with header.size + size in 249..252 ran up to 4 bytes past the 252-byte
+   * data region (mirror of the kernel x8h7_pkt_enq() fix, x8h7 f1e0ee9). */
+  if ((pkt->header.size + sizeof(subpkt.header) + size) > (SPI_DMA_BUFFER_SIZE - 4))
     goto cleanup;
 
   /* subpacket:
@@ -257,7 +266,6 @@ int enqueue_packet(uint8_t const peripheral, uint8_t const opcode, uint16_t cons
    * - uint16_t size;      | sizeof(subpacket.header) = 4 Bytes
    * - uint8_t raw_data;
    */
-  struct subpacket subpkt;
   subpkt.header.peripheral = peripheral;
   subpkt.header.opcode = opcode;
   subpkt.header.size = size;
