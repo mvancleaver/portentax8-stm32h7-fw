@@ -173,6 +173,11 @@ static volatile uint32_t s_tx_submitted[2], s_tx_reported[2], s_tx_aborted[2], s
 #define X8H7_TX_ABORT_SPIN_LIMIT 4000u   /* bounded wait for an abort to free a FIFO slot (no cycle counter under Arch-B) */
 void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle);
 
+/* Phase 07.4.42.2 (RESEARCH P1-1): RX frames dropped on the H7 (FIFO0 message lost, or popped from the FIFO but the
+ * SPI payload was full). Incremented by the RX FIFO0 ISR and (PRIMASK-guarded) by the can_handle_data() drain;
+ * reported as {INT_ERR, RX_OVR, n_lost} once per main-loop pass. Zeroed by fdcan_tx_accounting_reset(). */
+static volatile uint32_t s_rx_lost[2], s_rx_lost_reported[2];
+
 /* Report the CURRENT FDCAN error state as {INT_ERR, flags, TEC, REC} (wire contract row "error state").
  * flags come from PSR, not from the interrupt bits, because EP/EW/BO interrupts fire on both entry and exit.
  * Called from HAL_FDCAN_ErrorStatusCallback (FDCANx_IT0 ISR) and, for a pending retry, from can_handle_data()
@@ -208,6 +213,8 @@ void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle)
   s_tx_reported[k] = 0;
   s_tx_aborted[k] = 0;
   s_tx_aborted_reported[k] = 0;
+  s_rx_lost[k] = 0;
+  s_rx_lost_reported[k] = 0;
   __set_PRIMASK(primask_bit);
 }
 
@@ -244,6 +251,21 @@ static uint32_t fdcan_report_tx_finished(FDCAN_HandleTypeDef * handle)
   return delta;
 }
 
+/* Phase 07.4.42.2 (wire contract row "RX lost", 3 B): report RX drops not yet reported as
+ * {INT_ERR, RX_OVR, n_lost} (n clamped to 255; the rest goes in the next pass). Called once per main-loop pass
+ * from can_handle_data() per initialised handle, so the report is aggregated and rate-limited by construction.
+ * A MESSAGE_LOST interrupt counts one loss per episode (the flag does not count frames): n_lost is a lower bound. */
+static void fdcan_report_rx_overflow(FDCAN_HandleTypeDef * handle)
+{
+  int const k = (handle == &fdcan_1) ? 0 : 1;
+  uint32_t const unreported = s_rx_lost[k] - s_rx_lost_reported[k];
+  if (!unreported) return;
+  uint32_t const n = (unreported > 255u) ? 255u : unreported;
+  uint8_t x8_msg[3] = { X8H7_CAN_STS_INT_ERR, X8H7_CAN_STS_FLG_RX_OVR, (uint8_t)n };
+  if (enqueue_packet(k == 0 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg))
+    s_rx_lost_reported[k] += n;
+}
+
 /**************************************************************************************
  * FUNCTION DECLARATION
  **************************************************************************************/
@@ -270,7 +292,7 @@ int can_handle_data()
   /* Note: the last read package is lost in this implementation. We need to fix this by
    * implementing some peek method or by buffering messages in a ringbuffer.
    */
-  int rc_enq;
+  int rc_enq = 1;
 
   uint32_t const now = HAL_GetTick();
   /* Phase 07.1.5 Task 2 (Tier 1A bridge cadence fix):
@@ -320,7 +342,13 @@ int can_handle_data()
         memcpy(x8h7_msg.field.data, can_data, x8h7_msg.field.len);
 
         rc_enq = enqueue_packet(PERIPH_FDCAN1, CAN_RX_FRAME, X8H7_CAN_HEADER_SIZE + x8h7_msg.field.len, x8h7_msg.buf);
-        if (!rc_enq) break;
+        if (!rc_enq)
+        {
+          /* 07.4.42.2 P1-1: can_read already popped the frame — it is lost. PRIMASK: the RX ISR also increments. */
+          int const k = 0;
+          uint32_t const pm = __get_PRIMASK(); __set_PRIMASK(1); s_rx_lost[k]++; __set_PRIMASK(pm);
+          break;
+        }
 
         /* Phase 07.3 Plan 03 patch 0024 — additionally forward to the
          * cs8h7-can RPMsg endpoint (Option A parallel deployment per D-A2).
@@ -363,18 +391,22 @@ int can_handle_data()
         memcpy(x8h7_msg.field.data, can_data, x8h7_msg.field.len);
 
         rc_enq = enqueue_packet(PERIPH_FDCAN2, CAN_RX_FRAME, X8H7_CAN_HEADER_SIZE + x8h7_msg.field.len, x8h7_msg.buf);
-        if (!rc_enq) break;
+        if (!rc_enq)
+        {
+          /* 07.4.42.2 P1-1: can_read already popped the frame — it is lost. PRIMASK: the RX ISR also increments. */
+          int const k = 1;
+          uint32_t const pm = __get_PRIMASK(); __set_PRIMASK(1); s_rx_lost[k]++; __set_PRIMASK(pm);
+          break;
+        }
 
         can_2_last_enqueue = now;
       }
     }
   }
 
-  if (!rc_enq) {
-    // Report dropped rx packets next time there's a slot
-    // uint8_t x8_msg[2] = {X8H7_CAN_STS_FLG_RX_OVR, can_tx_fifo_available(handle)};
-    // enqueue_packet(handle == &fdcan_1 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg);
-  }
+  /* Phase 07.4.42.2 (P1-1): aggregated RX drop report (FIFO message lost + SPI-full drops). */
+  if (is_can1_init) fdcan_report_rx_overflow(&fdcan_1);
+  if (is_can2_init) fdcan_report_rx_overflow(&fdcan_2);
 
   return bytes_enqueued;
 }
@@ -732,6 +764,11 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
   uint8_t can_len = 0;
   uint8_t can_flags = 0;
   uint8_t can_data[X8H7_CAN_FRAME_MAX_DATA_LEN] = {0};
+  int const k = (hfdcan == &fdcan_1) ? 0 : 1;
+
+  /* Phase 07.4.42.2 (P1-1): RF0L — the FIFO was full and a frame was discarded (blocking mode). Armed in
+   * can_internal_init(); one count per interrupt (episode), reported by can_handle_data(). */
+  if (RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) s_rx_lost[k]++;
 
   /* Phase 07.4.6 (patch 0038) — also drain on NEW_MESSAGE so smart-MD
    * responses (typically 1 frame at a time, well under the watermark=2
@@ -759,7 +796,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
        * x8h7_can queue below is unchanged for non-smart-MD bus traffic. */
 
       int ret = enqueue_packet(hfdcan == &fdcan_1 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_RX_FRAME, X8H7_CAN_HEADER_SIZE + x8h7_msg.field.len, x8h7_msg.buf);
-      if (ret == 0) break;
+      if (ret == 0) { s_rx_lost[k]++; break; }   /* 07.4.42.2 P1-1: popped but not forwarded — lost */
 
       /* Phase 07.3 Plan 03 patch 0024 — ISR-side hook for the cs8h7-can
        * RPMsg endpoint (FDCAN1 only; FDCAN2 = carrier-hat external bus is
@@ -779,8 +816,9 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 
     /* Phase 07.1.5 Task 2 (Tier 1A bridge cadence fix):
      * Re-arm with NEW_MESSAGE so subsequent single frames also fire the ISR
-     * after we drained FIFO0 here. Mask must match can.c initial activation. */
-    if (HAL_FDCAN_ActivateNotification(hfdcan, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_FULL | FDCAN_IT_RX_FIFO0_WATERMARK, 0) != HAL_OK)
+     * after we drained FIFO0 here. Mask must match can.c initial activation
+     * (07.4.42.2: incl. MESSAGE_LOST). */
+    if (HAL_FDCAN_ActivateNotification(hfdcan, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_FULL | FDCAN_IT_RX_FIFO0_WATERMARK | FDCAN_IT_RX_FIFO0_MESSAGE_LOST, 0) != HAL_OK)
     {
       /* Notification Error */
     }

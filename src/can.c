@@ -164,8 +164,10 @@ int can_internal_init(FDCAN_HandleTypeDef * handle)
    * already mentioned NEW_MESSAGE; the activation mask was missing it. This
    * is the secondary half of the cadence fix (paired with the 10→0 ms throttle
    * drop in can_handler.c) — together they make RX delivery truly event-driven.
-   * Per Plan 07.1.5-01 INVESTIGATION-NOTES.md §"Proposed patch — Change 2". */
-  if (HAL_FDCAN_ActivateNotification(handle, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_FULL | FDCAN_IT_RX_FIFO0_WATERMARK, 0) != HAL_OK)
+   * Per Plan 07.1.5-01 INVESTIGATION-NOTES.md §"Proposed patch — Change 2".
+   * Phase 07.4.42.2 (P1-1): + MESSAGE_LOST so a frame discarded by a full FIFO0 is counted and reported to the
+   * kernel as {INT_ERR, RX_OVR, n} (can_handler.c fdcan_report_rx_overflow). */
+  if (HAL_FDCAN_ActivateNotification(handle, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_FULL | FDCAN_IT_RX_FIFO0_WATERMARK | FDCAN_IT_RX_FIFO0_MESSAGE_LOST, 0) != HAL_OK)
     Error_Handler("HAL_FDCAN_ActivateNotification(FDCAN_IT_RX_FIFO0_NEW_MESSAGE) Error_Handler\n");
 
   /* Phase 07.4.42.2 (regenerated stm32h7-fw 0091 — 7.4.42.1 T3/T4 intent): arm the FDCAN error-state
