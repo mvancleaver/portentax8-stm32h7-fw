@@ -61,6 +61,10 @@ FDCAN_HandleTypeDef fdcan_2;
 
 static uint32_t HAL_RCC_FDCAN_CLK_ENABLED = 0;
 
+/* Phase 07.4.42.2 (P0-4): TX accounting lives in can_handler.c; reset whenever the Tx FIFO is emptied by
+ * HAL_FDCAN_Init / HAL_FDCAN_DeInit. */
+extern void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle);
+
 /**************************************************************************************
  * FUNCTION DEFINITION
  **************************************************************************************/
@@ -238,6 +242,9 @@ void can_init(FDCAN_HandleTypeDef * handle, CANName peripheral,
               uint32_t const data_baud_rate_prescaler, uint32_t const data_time_segment_1,
               uint32_t const data_time_segment_2, uint32_t const data_sync_jump_width)
 {
+    /* Phase 07.4.42.2 (P0-4): HAL_FDCAN_Init empties the Tx FIFO — restart the TX finished accounting at zero. */
+    fdcan_tx_accounting_reset(handle);
+
     // Default values
     handle->Instance = (FDCAN_GlobalTypeDef *)peripheral;
 
@@ -333,6 +340,8 @@ void can_deinit(FDCAN_HandleTypeDef * handle)
 {
   HAL_FDCAN_Stop(handle);
   HAL_FDCAN_DeInit(handle);
+  /* Phase 07.4.42.2 (P0-4): the de-initialised controller has no pending TX — restart the accounting at zero. */
+  fdcan_tx_accounting_reset(handle);
 }
 
 int can_set_bittiming(FDCAN_HandleTypeDef * handle, uint32_t const baud_rate_prescaler, uint32_t const time_segment_1, uint32_t const time_segment_2, uint32_t const sync_jump_width)

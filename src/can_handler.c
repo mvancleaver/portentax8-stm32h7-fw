@@ -164,6 +164,15 @@ static uint32_t can_2_last_enqueue = 0;
 /* Phase 07.4.42.2: 1 = an error-state report could not be enqueued (SPI payload full); retried from can_handle_data(). */
 static volatile uint8_t s_err_state_pending[2] = {0, 0};
 
+/* Phase 07.4.42.2 (RESEARCH P0-4/P1-3): exact per-peripheral TX accounting for the kernel ring.
+ * finished = submitted - popcount(TXBRP) (completed + aborted + rejected); reported via
+ * {INT_TX_COMPLETE, n_finished, n_aborted}. Updated with PRIMASK set; retried from can_handle_data().
+ * Index k = 0 for fdcan_1, 1 for fdcan_2. The sticky TXBTO mask handed to the TX complete callback is NOT
+ * used: its bits stay set until the buffer is reused, so a popcount of it over-counts. */
+static volatile uint32_t s_tx_submitted[2], s_tx_reported[2], s_tx_aborted[2], s_tx_aborted_reported[2];
+#define X8H7_TX_ABORT_SPIN_LIMIT 4000u   /* bounded wait for an abort to free a FIFO slot (no cycle counter under Arch-B) */
+void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle);
+
 /* Report the CURRENT FDCAN error state as {INT_ERR, flags, TEC, REC} (wire contract row "error state").
  * flags come from PSR, not from the interrupt bits, because EP/EW/BO interrupts fire on both entry and exit.
  * Called from HAL_FDCAN_ErrorStatusCallback (FDCANx_IT0 ISR) and, for a pending retry, from can_handle_data()
@@ -185,6 +194,54 @@ static void fdcan_report_error_state(FDCAN_HandleTypeDef * handle)
   uint8_t const rec = (ec.RxErrorCnt > 127u) ? 127u : (uint8_t)ec.RxErrorCnt;
   uint8_t x8_msg[4] = { X8H7_CAN_STS_INT_ERR, flags, tec, rec };
   s_err_state_pending[k] = enqueue_packet(k == 0 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg) ? 0 : 1;
+}
+
+/* Phase 07.4.42.2: zero the TX accounting of one peripheral. Called by can_init() (before HAL_FDCAN_Init) and
+ * can_deinit() (after HAL_FDCAN_DeInit): both empty the Tx FIFO, so the counters restart from zero together with
+ * the kernel ring (which is reset on open / CAN_MODE_START / stop). */
+void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle)
+{
+  int const k = (handle == &fdcan_1) ? 0 : 1;
+  uint32_t const primask_bit = __get_PRIMASK();
+  __set_PRIMASK(1);
+  s_tx_submitted[k] = 0;
+  s_tx_reported[k] = 0;
+  s_tx_aborted[k] = 0;
+  s_tx_aborted_reported[k] = 0;
+  __set_PRIMASK(primask_bit);
+}
+
+/* Phase 07.4.42.2 (wire contract row "TX finished", 3 B): report every frame that finished since the last
+ * successful report as {INT_TX_COMPLETE, n_finished, n_aborted}. Count-based and therefore idempotent: if the SPI
+ * payload is full nothing is marked reported and the next call (TX ISR or the can_handle_data() retry) sends the
+ * accumulated delta. Returns the number of frames reported (0 = nothing new or enqueue failed). */
+static uint32_t fdcan_report_tx_finished(FDCAN_HandleTypeDef * handle)
+{
+  int const k = (handle == &fdcan_1) ? 0 : 1;
+  uint32_t const primask_bit = __get_PRIMASK();
+  __set_PRIMASK(1);
+  uint32_t const pending = (uint32_t)__builtin_popcount(handle->Instance->TXBRP);
+  uint32_t delta = (s_tx_submitted[k] - pending) - s_tx_reported[k];
+  if ((int32_t)delta <= 0)
+  {
+    __set_PRIMASK(primask_bit);
+    return 0;
+  }
+  if (delta > 255u) delta = 255u;
+  uint32_t ab = s_tx_aborted[k] - s_tx_aborted_reported[k];
+  if (ab > delta) ab = delta;
+  uint8_t x8_msg[3] = { X8H7_CAN_STS_INT_TX_COMPLETE, (uint8_t)delta, (uint8_t)ab };
+  if (enqueue_packet(k == 0 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg) > 0)
+  {
+    s_tx_reported[k] += delta;
+    s_tx_aborted_reported[k] += ab;
+  }
+  else
+  {
+    delta = 0;
+  }
+  __set_PRIMASK(primask_bit);
+  return delta;
 }
 
 /**************************************************************************************
@@ -239,6 +296,11 @@ int can_handle_data()
     __set_PRIMASK(primask_bit);
   }
 
+  /* Phase 07.4.42.2 (P0-4): report any TX finished count a TX ISR could not enqueue (SPI payload full) —
+   * a lost TX_COMPLETE status must not wedge the kernel ring. No-op (one TXBRP read) when nothing is new. */
+  if (is_can1_init) (void)fdcan_report_tx_finished(&fdcan_1);
+  if (is_can2_init) (void)fdcan_report_tx_finished(&fdcan_2);
+
   if (is_can1_init)
   {
     bool const can_1_rx_fifo_frames_available = can_rx_fifo_available(&fdcan_1, FDCAN_RX_FIFO0) > 0;
@@ -277,7 +339,7 @@ int can_handle_data()
     /* Phase 07.4.8 patch 0043 — Layer 1 exclusive FDCAN2 RX FIFO0 ownership
      * (D-01b DISABLE branch). Pitfall 3 SECOND prong (the main-loop drain
      * skip — see on_CAN_INIT_Request above for the IRQ-notification prong).
-     * When smart_md owns FDCAN2 the lockstep DWT-spin matcher in
+     * When smart_md owns FDCAN2 the lockstep cycle-counter spin matcher in
      * dwt_rx_match_or_timeout() must see its own motor responses; the
      * non-MD-aware drain here would steal them. Both prongs are mandatory
      * per Plan 01 AUDIT §6 + RESEARCH §"Pitfall 3"; the kernel-side
@@ -505,13 +567,44 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
   }
 #endif
 
+  int const k = (handle == &fdcan_1) ? 0 : 1;
+  uint8_t const periph = (k == 0) ? PERIPH_FDCAN1 : PERIPH_FDCAN2;
+
   if (!can_tx_fifo_available(handle))
   {
-    uint8_t x8_msg[2] = {X8H7_CAN_STS_INT_ERR, X8H7_CAN_STS_FLG_TX_OVR};
-    return enqueue_packet(handle == &fdcan_1 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg);
+    /* 07.4.42.2 P1-3: abort the OLDEST pending element — a control target older than one cycle is
+     * worthless, and with no ACK on the bus AutoRetransmission would hold it forever. TXFQS.TFGI is the
+     * Tx FIFO get index (oldest pending element). This runs inside dma_handle_data()'s PRIMASK section, so
+     * the wait for the freed slot is iteration-bounded (an element mid-transmission is cancelled at the end
+     * of the current attempt) and never blocks. The abort is reported through fdcan_report_tx_finished()
+     * (abort callback or main-loop retry) as finished + aborted. */
+    uint32_t const gi = (handle->Instance->TXFQS & FDCAN_TXFQS_TFGI_Msk) >> FDCAN_TXFQS_TFGI_Pos;
+    if (HAL_FDCAN_AbortTxRequest(handle, 1UL << gi) == HAL_OK)
+    {
+      uint32_t const pm_abort = __get_PRIMASK(); __set_PRIMASK(1); s_tx_aborted[k]++; __set_PRIMASK(pm_abort);
+      for (uint32_t spin = 0; spin < X8H7_TX_ABORT_SPIN_LIMIT && !can_tx_fifo_available(handle); ++spin) { __NOP(); }
+    }
   }
 
+  if (!can_tx_fifo_available(handle))
+  {
+    /* Still full: reject this frame. Rejected = finished + aborted (it never set TXBRP), so the kernel ring
+     * retires it through the TX finished count; the 3-byte TX_OVR is informational (kernel must not retire on it). */
+    uint32_t const pm_rej = __get_PRIMASK(); __set_PRIMASK(1); s_tx_submitted[k]++; s_tx_aborted[k]++; __set_PRIMASK(pm_rej);
+    uint8_t x8_msg[3] = {X8H7_CAN_STS_INT_ERR, X8H7_CAN_STS_FLG_TX_OVR, 0};
+    (void)enqueue_packet(periph, CAN_STATUS, sizeof(x8_msg), x8_msg);
+    (void)fdcan_report_tx_finished(handle);
+    return 0;
+  }
+
+  /* Submit and count atomically: no TX ISR may compute submitted - popcount(TXBRP) between the TXBAR write and
+   * the increment. A failed can_write never set TXBRP, so counting it as submitted (+ aborted) makes it
+   * "finished" immediately. */
+  uint32_t const pm = __get_PRIMASK(); __set_PRIMASK(1);
   int const rc = can_write(handle, msg->field.id, msg->field.len, msg->field.data, msg->field.flags);
+  s_tx_submitted[k]++;
+  if (rc < 0) s_tx_aborted[k]++;   /* submit failed: finished + aborted */
+  __set_PRIMASK(pm);
 
   /* Phase 06.3 cycle 6 — H7-T12 trace. Dumps FDCAN1 PSR/CCCR/TXBRP/TXFQS
    * and the RCC FDCANSEL kernel-clock source field IMMEDIATELY after the
@@ -583,8 +676,11 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
 
   if (rc < 0)
   {
-    uint8_t x8_msg[2] = {X8H7_CAN_STS_INT_ERR, X8H7_CAN_STS_FLG_TX_EP};
-    return enqueue_packet(handle == &fdcan_1 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg);
+    /* Per-frame submit failure (NOT error-passive, RESEARCH P1-4). Informational 3-byte status: the frame is
+     * retired through the TX finished count (counted as submitted + aborted above). */
+    uint8_t x8_msg[3] = {X8H7_CAN_STS_INT_ERR, X8H7_CAN_STS_FLG_TX_EP, 0};
+    (void)enqueue_packet(periph, CAN_STATUS, sizeof(x8_msg), x8_msg);
+    (void)fdcan_report_tx_finished(handle);
   }
   return 0;
 }
@@ -600,16 +696,17 @@ void HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef * handle, uint32_t B
   }
 #endif
 
-  uint8_t x8_msg[2] = {X8H7_CAN_STS_INT_TX_COMPLETE, BufferIndexes};
-  int const enq_rc = enqueue_packet(handle == &fdcan_1 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg);
-  (void)enq_rc;  /* consumed only by H7-T6 trace below when DEBUG_H7_TX_TRACE */
+  /* Phase 07.4.42.2 (P0-4): count-based report; BufferIndexes (sticky TXBTO & TXBTIE) is not used for accounting. */
+  uint32_t const reported = fdcan_report_tx_finished(handle);
+  (void)reported;  /* consumed only by H7-T6 trace below when DEBUG_H7_TX_TRACE */
 
 #if DEBUG_H7_TX_TRACE
   /* Phase 06.2 Plan 03c — H7-T6 trace. Confirms the IRQ-back STATUS reply
-   * was successfully appended to the SPI TX buffer. v0=enq_rc (>0 ok). */
+   * was appended to the SPI TX buffer. v0=frames reported by this call
+   * (07.4.42.2: count-based; 0 = nothing new or SPI payload full). */
   {
-    int8_t rc8 = (enq_rc > 127) ? 127 : ((enq_rc < -127) ? -127 : (int8_t)enq_rc);
-    uint8_t trace_buf[5] = { 6, (uint8_t)rc8, (uint8_t)(BufferIndexes & 0xFF), 0, 0 };
+    uint8_t const rep8 = (reported > 255u) ? 255u : (uint8_t)reported;
+    uint8_t trace_buf[5] = { 6, rep8, (uint8_t)(BufferIndexes & 0xFF), 0, 0 };
     enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_buf), trace_buf);
   }
 #endif
@@ -617,8 +714,10 @@ void HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef * handle, uint32_t B
 
 void HAL_FDCAN_TxBufferAbortCallback(FDCAN_HandleTypeDef * handle, uint32_t BufferIndexes)
 {
-  uint8_t x8_msg[2] = {X8H7_CAN_STS_INT_TX_ABORT_COMPLETE, BufferIndexes};
-  enqueue_packet(handle == &fdcan_1 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg);
+  /* Phase 07.4.42.2 (P0-4/P1-3): an aborted element is reported in the TX finished count (as aborted);
+   * the new firmware no longer sends the legacy per-mask TX_ABORT_COMPLETE status. */
+  (void)BufferIndexes;
+  (void)fdcan_report_tx_finished(handle);
 }
 
 void HAL_FDCAN_TxFifoEmptyCallback(FDCAN_HandleTypeDef * handle)
