@@ -58,6 +58,24 @@
 #define X8H7_CAN_STS_INT_TX_ABORT_COMPLETE 0x08
 #define X8H7_CAN_STS_INT_TX_FIFO_EMPTY     0x10
 
+/* Phase 07.4.5 (patch 0036) — compile-gate the Phase 06.2 Plan 03c H7-T5/T6
+ * OPCODE_TRACE emits.  These debug traces fire on every FDCAN TX completion
+ * (incl. every smart-MD write), wasting ~30 B of SPI bandwidth per can_write
+ * AND triggering the matching A53-side pr_info (now gated by x8h7/0015 in
+ * the kernel module, but the wasted SPI traffic and per-packet dispatch
+ * cost persist on the wire).
+ *
+ * 07.4.42.2 P1-2: also gates H7-T2/T2.5/T3/T4/T12/T13 — 27+ bytes per TX
+ * frame in the 252-byte H7→X8 payload that must carry the motor ACKs.
+ * Defined here (before the first user) so every per-frame trace sees it.
+ *
+ * Default DEBUG_H7_TX_TRACE = 0.  Set to 1 (-DDEBUG_H7_TX_TRACE=1) to restore
+ * Phase 06.2 trace instrumentation for future FDCAN TX-path debugging.
+ * Companion to kernel patch x8h7/0015 (gates the matching pr_info in pkt_parse). */
+#ifndef DEBUG_H7_TX_TRACE
+#define DEBUG_H7_TX_TRACE 0
+#endif
+
 /**************************************************************************************
  * TYPEDEF
  **************************************************************************************/
@@ -302,6 +320,7 @@ int can_handle_data()
 int fdcan1_handler(uint8_t const opcode, uint8_t const * data, uint16_t const size)
 {
   dbg_printf("fdcan1_handler\n");
+#if DEBUG_H7_TX_TRACE
   /* Phase 06.2 Plan 03c — H7-T2 trace. Captures BEFORE the silent-drop
    * guard so we can distinguish "handler entered but is_can1_init=0"
    * from "handler reached fdcan_handler". */
@@ -309,6 +328,7 @@ int fdcan1_handler(uint8_t const opcode, uint8_t const * data, uint16_t const si
     uint8_t trace_buf[5] = { 2, opcode, (uint8_t)is_can1_init, 0, 0 };
     enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_buf), trace_buf);
   }
+#endif
   if (!is_can1_init && opcode != CAN_INIT) return 0;
   else return fdcan_handler(&fdcan_1, opcode, data, size);
 }
@@ -374,6 +394,7 @@ int fdcan_handler(FDCAN_HandleTypeDef * handle, uint8_t const opcode, uint8_t co
      * etc. are undefined. */
     union x8h7_can_frame_message msg = {0};
     memcpy(&msg, data, size);
+#if DEBUG_H7_TX_TRACE
     /* Phase 06.2 Plan 03c cycle 2 — H7-T2.5 raw-byte trace. Dumps the
      * actual wire bytes at offsets 3..6 of msg.buf. Per the wire
      * invariant these should be 00 04 00 DE for cansend 100#DEADBEEF. */
@@ -381,6 +402,7 @@ int fdcan_handler(FDCAN_HandleTypeDef * handle, uint8_t const opcode, uint8_t co
       uint8_t trace_buf[5] = { 7, msg.buf[3], msg.buf[4], msg.buf[5], msg.buf[6] };
       enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_buf), trace_buf);
     }
+#endif
     dbg_printf("fdcan_handler: sending CAN message to %lx, size %d, content[0]=0x%02X\n", msg.field.id, msg.field.len, msg.field.data[0]);
     return on_CAN_TX_FRAME_Request(handle, &msg);
   }
@@ -472,6 +494,7 @@ int on_CAN_FILTER_Request(FDCAN_HandleTypeDef * handle, uint32_t const filter_in
 
 int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_message const * msg)
 {
+#if DEBUG_H7_TX_TRACE
   /* Phase 06.2 Plan 03c — H7-T3 trace. Captures handler entry + TX FIFO
    * availability BEFORE we attempt the HAL submit. v0=fifo_avail (low byte),
    * v1=msg.len, v2=msg.flags. */
@@ -480,6 +503,7 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
     uint8_t trace_buf[5] = { 3, (uint8_t)(fifo_avail & 0xFF), msg->field.len, msg->field.flags, (handle == &fdcan_1) ? 1 : 2 };
     enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_buf), trace_buf);
   }
+#endif
 
   if (!can_tx_fifo_available(handle))
   {
@@ -496,6 +520,7 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
    * T12.C=TXBRP+TXFQS+FDCANSEL). Decision matrix in patches/stm32h7-fw/
    * 0012-canfd-trace-fdcan-registers.patch header. Only fires for fdcan_1
    * (fdcan_2 is structurally identical and currently unused). */
+#if DEBUG_H7_TX_TRACE
   if (handle == &fdcan_1)
   {
     uint32_t const psr      = FDCAN1->PSR;
@@ -510,6 +535,7 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
     enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_b), trace_b);
     enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_c), trace_c);
   }
+#endif
 
   /* Phase 06.3 cycle 7 — H7-T13 trace. Dumps GPIOD->{MODER, AFR[0],
    * OTYPER, OSPEEDR} field slices for PD0 (FDCAN1_RX) and PD1
@@ -519,6 +545,7 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
    * trace fault). 4 back-to-back 5-byte records. Decision matrix in
    * patches/stm32h7-fw/0013-canfd-trace-gpio-runtime.patch header.
    * Only fires for fdcan_1. */
+#if DEBUG_H7_TX_TRACE
   if (handle == &fdcan_1)
   {
     uint32_t const moder   = GPIOD->MODER;
@@ -542,7 +569,9 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
     enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_2), trace_2);
     enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_3), trace_3);
   }
+#endif
 
+#if DEBUG_H7_TX_TRACE
   /* Phase 06.2 Plan 03c — H7-T4 trace. Captures the can_write return code
    * (which is the negated HAL_FDCAN_GetError() value, or 0 on success). */
   {
@@ -550,6 +579,7 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
     uint8_t trace_buf[5] = { 4, (uint8_t)rc8, (uint8_t)((uint32_t)(-rc) & 0xFF), (uint8_t)(((uint32_t)(-rc) >> 8) & 0xFF), (uint8_t)(((uint32_t)(-rc) >> 16) & 0xFF) };
     enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_buf), trace_buf);
   }
+#endif
 
   if (rc < 0)
   {
@@ -558,20 +588,6 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
   }
   return 0;
 }
-
-/* Phase 07.4.5 (patch 0036) — compile-gate the Phase 06.2 Plan 03c H7-T5/T6
- * OPCODE_TRACE emits.  These debug traces fire on every FDCAN TX completion
- * (incl. every smart-MD write), wasting ~30 B of SPI bandwidth per can_write
- * AND triggering the matching A53-side pr_info (now gated by x8h7/0015 in
- * the kernel module, but the wasted SPI traffic and per-packet dispatch
- * cost persist on the wire).
- *
- * Default DEBUG_H7_TX_TRACE = 0.  Set to 1 to restore Phase 06.2 trace
- * instrumentation for future FDCAN TX-path debugging.  Companion to kernel
- * patch x8h7/0015 (gates the matching pr_info in pkt_parse). */
-#ifndef DEBUG_H7_TX_TRACE
-#define DEBUG_H7_TX_TRACE 0
-#endif
 
 void HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef * handle, uint32_t BufferIndexes)
 {
