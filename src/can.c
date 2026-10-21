@@ -52,6 +52,28 @@
 #define X8H7_FDCAN_TDCO     10
 #define X8H7_FDCAN_TDCF     0
 
+/* Phase 07.4.42.2 (RESEARCH P1-8): STM32H747 FDCAN message RAM is 0x2800 B = 10 KB = 2560 words shared by
+ * FDCAN1+FDCAN2 (stm32h7xx_hal_fdcan.c:235), NOT 2560 B. FDCAN1 keeps its 160-word layout at offset 0;
+ * FDCAN2 gets 64-byte elements (no silent truncation of > 32-byte frames: HAL_FDCAN_GetRxMessage copies
+ * DLCtoBytes[DLC] bytes regardless of element size) with deep FIFOs, placed right after FDCAN1. */
+#define X8H7_FDCAN1_STD_FILTERS   8u
+#define X8H7_FDCAN1_EXT_FILTERS   4u
+#define X8H7_FDCAN1_RXF0_ELEMS    4u
+#define X8H7_FDCAN1_TXQ_ELEMS     4u
+#define X8H7_FDCAN_ELEM_WORDS_64  18u   /* 8 B header + 64 B data */
+#define X8H7_FDCAN1_RAM_WORDS     (X8H7_FDCAN1_STD_FILTERS + 2u * X8H7_FDCAN1_EXT_FILTERS + \
+                                   (X8H7_FDCAN1_RXF0_ELEMS + X8H7_FDCAN1_TXQ_ELEMS) * X8H7_FDCAN_ELEM_WORDS_64)  /* 160 */
+#define X8H7_FDCAN2_RXF0_ELEMS    32u
+#define X8H7_FDCAN2_TXQ_ELEMS     16u
+#define X8H7_FDCAN2_RAM_WORDS     (8u + 2u * 4u + (X8H7_FDCAN2_RXF0_ELEMS + X8H7_FDCAN2_TXQ_ELEMS) * X8H7_FDCAN_ELEM_WORDS_64)  /* 880 */
+#define X8H7_FDCAN_MSGRAM_WORDS   2560u /* 0x2800 / 4 */
+_Static_assert(X8H7_FDCAN1_RAM_WORDS + X8H7_FDCAN2_RAM_WORDS <= X8H7_FDCAN_MSGRAM_WORDS, "FDCAN message RAM layout exceeds 10 KB");
+/* The layout math above must track what can_init() actually programs. */
+_Static_assert(X8H7_FDCAN_ELEM_WORDS_64 == FDCAN_DATA_BYTES_64, "FDCAN_DATA_BYTES_64 is the element size in words (8 B header + 64 B data)");
+_Static_assert(X8H7_FDCAN1_STD_FILTERS == 8u && X8H7_FDCAN1_EXT_FILTERS == 4u, "X8H7_FDCAN2_RAM_WORDS assumes 8 std + 4 ext filters (both FDCANs)");
+_Static_assert(X8H7_FDCAN2_RXF0_ELEMS <= 64u && X8H7_FDCAN2_TXQ_ELEMS <= 32u, "M_CAN limits: Rx FIFO <= 64 elements, Tx buffers + FIFO <= 32");
+_Static_assert(X8H7_FDCAN1_RAM_WORDS == 160u && X8H7_FDCAN2_RAM_WORDS == 880u, "07.4.42.2 layout: FDCAN1 160 words + FDCAN2 880 words = 4160 B");
+
 /**************************************************************************************
  * GLOBAL VARIABLES
  **************************************************************************************/
@@ -133,10 +155,25 @@ void HAL_FDCAN_MspDeInit(FDCAN_HandleTypeDef *hfdcan)
   }
 }
 
+/* Phase 07.4.42.2 (P1-8): FDCAN2's MessageRAMOffset (words) = end of FDCAN1's block. Derived from FDCAN1's
+ * HAL-computed EndAddress when FDCAN1 is initialised; the compile-time FDCAN1 size covers the case where can1 is
+ * brought up before or without can0 (fdcan_1.msgRam is still zero then). */
+static uint32_t fdcan2_ram_offset_words(void)
+{
+  uint32_t off = X8H7_FDCAN1_RAM_WORDS;
+  if (fdcan_1.msgRam.EndAddress > SRAMCAN_BASE)
+  {
+    uint32_t const used = (fdcan_1.msgRam.EndAddress - SRAMCAN_BASE) / 4u;
+    if (used > off) off = used;
+  }
+  return off;
+}
+
 int can_internal_init(FDCAN_HandleTypeDef * handle)
 {
+  /* Phase 07.4.42.2 (P1-8): fail loudly when the HAL's own end-address check rejects the layout. */
   if (HAL_FDCAN_Init(handle) != HAL_OK)
-    Error_Handler("HAL_FDCAN_Init Error_Handler\n");
+    Error_Handler((HAL_FDCAN_GetError(handle) & HAL_FDCAN_ERROR_PARAM) ? "HAL_FDCAN_Init: message RAM layout exceeds SRAMCAN (HAL_FDCAN_ERROR_PARAM)\n" : "HAL_FDCAN_Init Error_Handler\n");
 
   if (can_filter(handle, 0, 0, 0, false) == 0)
     Error_Handler("can_filter Error_Handler\n");
@@ -213,25 +250,16 @@ int can_internal_init(FDCAN_HandleTypeDef * handle)
     enqueue_packet(0x09, 0x79, sizeof(trace_buf), trace_buf);
   }
 
-  /* Phase 06.2 Plan 03c cycle 5 — H7-T11 trace. Compute the runtime
-   * total message-RAM bytes used by this peripheral and report whether
-   * we fit inside the 1280 B per-peripheral budget (RM0399 §56.4.5).
-   * Element sizes are hardcoded for FDCAN_DATA_BYTES_64 (=64 B data +
-   * 8 B header = 72 B per FIFO/buffer element). Filters: Std=4 B,
-   * Ext=8 B. TxEvent=8 B. */
-  if (handle == &fdcan_1)
+  /* Phase 06.2 Plan 03c cycle 5 — H7-T11 trace, rewritten in 07.4.42.2 (P1-8): report the HAL-computed
+   * message-RAM end of THIS peripheral, in words from SRAMCAN_BASE (FDCAN1 -> 160, FDCAN2 -> 1040), and
+   * whether it lies inside the real 10 KB SRAMCAN (the same end-address check HAL_FDCAN_Init applies).
+   * Emitted for both peripherals, init-time only.
+   * Bytes: {11, end_words lo, end_words hi, periph (1 = FDCAN1, 2 = FDCAN2), budget_ok}. */
   {
     extern int enqueue_packet(uint8_t peripheral, uint8_t opcode, uint16_t size, void * data);
-    uint32_t const total = handle->Init.StdFiltersNbr        * 4u
-                         + handle->Init.ExtFiltersNbr        * 8u
-                         + handle->Init.RxFifo0ElmtsNbr      * (8u + 64u)
-                         + handle->Init.RxFifo1ElmtsNbr      * (8u + 64u)
-                         + handle->Init.RxBuffersNbr         * (8u + 64u)
-                         + handle->Init.TxEventsNbr          * 8u
-                         + handle->Init.TxFifoQueueElmtsNbr  * (8u + 64u);
-    uint8_t const budget_ok = (total <= 1280u) ? 1u : 0u;
-    uint8_t trace_buf[5] = { 11, (uint8_t)(total & 0xFF), (uint8_t)((total >> 8) & 0xFF),
-                             (uint8_t)((total >> 16) & 0xFF), budget_ok };
+    uint32_t const end_words = (handle->msgRam.EndAddress - SRAMCAN_BASE) / 4u;
+    uint8_t const budget_ok = (handle->msgRam.EndAddress <= (SRAMCAN_BASE + (X8H7_FDCAN_MSGRAM_WORDS * 4u) - 4u)) ? 1u : 0u;
+    uint8_t trace_buf[5] = { 11, (uint8_t)(end_words & 0xFF), (uint8_t)((end_words >> 8) & 0xFF), (handle == &fdcan_1) ? 1u : 2u, budget_ok };
     enqueue_packet(0x09, 0x79, sizeof(trace_buf), trace_buf);
   }
 
@@ -278,59 +306,51 @@ void can_init(FDCAN_HandleTypeDef * handle, CANName peripheral,
     handle->Init.DataTimeSeg2      = data_time_segment_2      ? data_time_segment_2      : 0x1;
 
     /* Message RAM offset is only supported in STM32H7 platforms of supported FDCAN platforms */
-    /* Phase 06.5 D-05 — separate FDCAN1 (offset 0, 160 words) from FDCAN2
-     * (offset 160, 160 words) in the 640-word SRAMCAN region. FDCAN2
-     * footprint mirrors FDCAN1's reduced layout (Plan 03c cycle 5).
-     * MessageRAMOffset is in 32-bit-word units per RM0399 §56.4.5 +
-     * HAL_FDCAN_CalculateRamBlockAddresses. Total: 320 words = 1280 B = 50% of budget. */
-    handle->Init.MessageRAMOffset = (handle == &fdcan_2) ? 160u : 0u;
+    /* Phase 07.4.42.2 (RESEARCH P1-8) — message RAM layout. The SRAMCAN region is 0x2800 B = 10 KB = 2560 words
+     * shared by FDCAN1 + FDCAN2 (FDCAN_MESSAGE_RAM_SIZE, stm32h7xx_hal_fdcan.c:235); the earlier "2560 B / 640-word"
+     * budget was a 4x mis-read. MessageRAMOffset, filter and element sizes are 32-bit word counts
+     * (FDCAN_CalcultateRamBlockAddresses: std filter 1 word, ext filter 2 words, 64-byte element 18 words);
+     * HAL_FDCAN_Init rejects with HAL_FDCAN_ERROR_PARAM any layout whose EndAddress passes SRAMCAN_BASE + 0x2800 - 4.
+     *   FDCAN1 (can0):            offset 0,   8 std + 4 ext filters, Rx FIFO0  4 + Tx FIFO  4 =  160 words ( 640 B)
+     *   FDCAN2 (can1, motor bus): offset 160, 8 std + 4 ext filters, Rx FIFO0 32 + Tx FIFO 16 =  880 words (3520 B)
+     *   Total 1040 words = 4160 B of 10240 B. FDCAN2's offset is FDCAN1's HAL-computed end (fdcan2_ram_offset_words). */
+    handle->Init.MessageRAMOffset = (handle == &fdcan_2) ? fdcan2_ram_offset_words() : 0u;
 
-    /* The number of Standard and Extended ID filters are initialized to the maximum possible extent
-     * for STM32H7 platforms
-     */
-    handle->Init.StdFiltersNbr = 8;  // Plan 03c cycle 5 — reduced from 128 (RAM budget); only idx 0 used at init
-    handle->Init.ExtFiltersNbr = 4;  // Plan 03c cycle 5 — reduced from 64 (RAM budget); only idx 0 used at init
+    /* 8 standard + 4 extended ID filters on both peripherals (index 0 is set at init; the kernel may add more via
+     * CAN_FILTER). These counts are part of the X8H7_FDCAN1/2_RAM_WORDS math (compile-time checked). */
+    handle->Init.StdFiltersNbr = X8H7_FDCAN1_STD_FILTERS;
+    handle->Init.ExtFiltersNbr = X8H7_FDCAN1_EXT_FILTERS;
 
-    /* Phase 07.4.42.1 T2 — FDCAN2 FIFO depth + element-size hardening.
-     * FDCAN2 (can1, motor bus) uses 32-byte elements (FDCAN_DATA_BYTES_32 =
-     * 8 B header + 32 B data = 40 B/element).  No frame on can1 exceeds 24 B
-     * (motor 0xA0 response = 24 B; SET_TARGETS/WRITE_REGISTER writes <= 12 B),
-     * so 32-byte elements are sufficient and roughly halve per-element RAM cost.
-     *
-     * RAM math (FDCAN2 only, 32-byte elements):
-     *   Std filters:  8  x 4 B       =  32 B
-     *   Ext filters:  4  x 8 B       =  32 B
-     *   RxFIFO0:     16  x 40 B      = 640 B   (4 -> 16-deep; absorbs 6-motor burst)
-     *   TxFIFO:       8  x 40 B      = 320 B   (4 -> 8-deep; >= X8H7_CAN_BATCH_MAX=6)
-     *   Total:                          1024 B  <= 1280 B (256 B headroom) OK
-     *
-     * FDCAN1 (cs8h7-can / RPMsg bus) keeps FDCAN_DATA_BYTES_64 because its max
-     * FD frame size has not been independently verified to be <= 32 B.
-     * Conditionalize both depth and element-size on handle == &fdcan_2 (Pitfall 2). */
+    /* Phase 07.4.42.2 (P1-8) — 64-byte elements on BOTH peripherals. The 07.4.42.1 T2 32-byte elements silently
+     * corrupted any > 32-byte frame: the peripheral stores only the first 32 data bytes but keeps the DLC, and
+     * HAL_FDCAN_GetRxMessage copies DLCtoBytes[DLC] bytes, so bytes 32..63 came from the NEXT FIFO element.
+     * FDCAN2 (can1, motor bus) gets deep FIFOs: Rx FIFO0 32 rides out several 6-motor 0xA0 bursts while the SPI
+     * payload is busy; Tx FIFO 16 = 2 x the kernel X8H7_CAN_BATCH_MAX (8). FDCAN1 keeps its 4/4 layout.
+     * Conditionalised on handle == &fdcan_2 (Pitfall 2). */
     if (handle == &fdcan_2) {
-      /* FDCAN2: motor bus -- 32-byte elements, deep FIFOs. */
-      handle->Init.RxFifo0ElmtsNbr  = 16;                    /* 16 x 40 B = 640 B; absorbs 6-motor simultaneous 0xA0 burst */
-      handle->Init.RxFifo0ElmtSize  = FDCAN_DATA_BYTES_32;
-      handle->Init.RxFifo1ElmtsNbr  =  0;
-      handle->Init.RxFifo1ElmtSize  = FDCAN_DATA_BYTES_32;
-      handle->Init.RxBuffersNbr     =  0;
-      handle->Init.RxBufferSize     = FDCAN_DATA_BYTES_32;
-      handle->Init.TxEventsNbr         = 0;
-      handle->Init.TxBuffersNbr        =  0;
-      handle->Init.TxFifoQueueElmtsNbr = 8;                  /* 8 x 40 B = 320 B; >= X8H7_CAN_BATCH_MAX=6 */
-      handle->Init.TxFifoQueueMode     = FDCAN_TX_FIFO_OPERATION;
-      handle->Init.TxElmtSize          = FDCAN_DATA_BYTES_32;
-    } else {
-      /* FDCAN1: cs8h7-can / RPMsg bus -- keep 64-byte elements (Plan 03c cycle 5 baseline). */
-      handle->Init.RxFifo0ElmtsNbr  =  4;                    /* 4 x 72 B = 288 B */
+      /* FDCAN2: motor bus -- 64-byte elements, deep FIFOs. */
+      handle->Init.RxFifo0ElmtsNbr  = X8H7_FDCAN2_RXF0_ELEMS; /* 32 x 72 B = 2304 B */
       handle->Init.RxFifo0ElmtSize  = FDCAN_DATA_BYTES_64;
       handle->Init.RxFifo1ElmtsNbr  =  0;
       handle->Init.RxFifo1ElmtSize  = FDCAN_DATA_BYTES_64;
       handle->Init.RxBuffersNbr     =  0;
       handle->Init.RxBufferSize     = FDCAN_DATA_BYTES_64;
       handle->Init.TxEventsNbr         = 0;
-      handle->Init.TxBuffersNbr        =  0;
-      handle->Init.TxFifoQueueElmtsNbr = 4;                  /* 4 x 72 B = 288 B */
+      handle->Init.TxBuffersNbr        = 0;
+      handle->Init.TxFifoQueueElmtsNbr = X8H7_FDCAN2_TXQ_ELEMS; /* 16 x 72 B = 1152 B */
+      handle->Init.TxFifoQueueMode     = FDCAN_TX_FIFO_OPERATION;
+      handle->Init.TxElmtSize          = FDCAN_DATA_BYTES_64;
+    } else {
+      /* FDCAN1: cs8h7-can / RPMsg bus -- 64-byte elements (Plan 03c cycle 5 baseline). */
+      handle->Init.RxFifo0ElmtsNbr  = X8H7_FDCAN1_RXF0_ELEMS; /* 4 x 72 B = 288 B */
+      handle->Init.RxFifo0ElmtSize  = FDCAN_DATA_BYTES_64;
+      handle->Init.RxFifo1ElmtsNbr  =  0;
+      handle->Init.RxFifo1ElmtSize  = FDCAN_DATA_BYTES_64;
+      handle->Init.RxBuffersNbr     =  0;
+      handle->Init.RxBufferSize     = FDCAN_DATA_BYTES_64;
+      handle->Init.TxEventsNbr         = 0;
+      handle->Init.TxBuffersNbr        = 0;
+      handle->Init.TxFifoQueueElmtsNbr = X8H7_FDCAN1_TXQ_ELEMS; /* 4 x 72 B = 288 B */
       handle->Init.TxFifoQueueMode     = FDCAN_TX_FIFO_OPERATION;
       handle->Init.TxElmtSize          = FDCAN_DATA_BYTES_64;
     }
