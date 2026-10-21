@@ -143,6 +143,32 @@ static bool is_can2_init = false;
 static uint32_t can_1_last_enqueue = 0;
 static uint32_t can_2_last_enqueue = 0;
 
+/* Phase 07.4.42.2: 1 = an error-state report could not be enqueued (SPI payload full); retried from can_handle_data(). */
+static volatile uint8_t s_err_state_pending[2] = {0, 0};
+
+/* Report the CURRENT FDCAN error state as {INT_ERR, flags, TEC, REC} (wire contract row "error state").
+ * flags come from PSR, not from the interrupt bits, because EP/EW/BO interrupts fire on both entry and exit.
+ * Called from HAL_FDCAN_ErrorStatusCallback (FDCANx_IT0 ISR) and, for a pending retry, from can_handle_data()
+ * inside a PRIMASK critical section. Reads PSR/ECR only; never restarts the controller. */
+static void fdcan_report_error_state(FDCAN_HandleTypeDef * handle)
+{
+  int const k = (handle == &fdcan_1) ? 0 : 1;
+  FDCAN_ProtocolStatusTypeDef ps;
+  FDCAN_ErrorCountersTypeDef ec;
+  if (HAL_FDCAN_GetProtocolStatus(handle, &ps) != HAL_OK || HAL_FDCAN_GetErrorCounters(handle, &ec) != HAL_OK) {
+    s_err_state_pending[k] = 1;
+    return;
+  }
+  uint8_t flags = 0;
+  if (ps.BusOff)       flags |= X8H7_CAN_STS_FLG_TX_BO;
+  if (ps.ErrorPassive) flags |= (X8H7_CAN_STS_FLG_TX_EP | X8H7_CAN_STS_FLG_RX_EP);
+  if (ps.Warning)      flags |= X8H7_CAN_STS_FLG_EWARN;
+  uint8_t const tec = (ec.TxErrorCnt > 255u) ? 255u : (uint8_t)ec.TxErrorCnt;
+  uint8_t const rec = (ec.RxErrorCnt > 127u) ? 127u : (uint8_t)ec.RxErrorCnt;
+  uint8_t x8_msg[4] = { X8H7_CAN_STS_INT_ERR, flags, tec, rec };
+  s_err_state_pending[k] = enqueue_packet(k == 0 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_STATUS, sizeof(x8_msg), x8_msg) ? 0 : 1;
+}
+
 /**************************************************************************************
  * FUNCTION DECLARATION
  **************************************************************************************/
@@ -182,6 +208,18 @@ int can_handle_data()
    * Setting to 0 means "deliver every frame on every main-loop tick"
    * (sub-millisecond on H7). See Plan 07.1.5-01 INVESTIGATION-NOTES.md. */
   static uint32_t const RX_CAN_FRAME_SYNC_TIMEOUT = 0;
+
+  /* Phase 07.4.42.2 (regenerated 0091): retry an error-state report that found the SPI payload full.
+   * PRIMASK (saved/restored — enqueue_packet nests the same way) so the FDCAN ISR cannot report a newer
+   * state between this PSR read and this enqueue: the kernel must receive the latest state last. */
+  if ((is_can1_init && s_err_state_pending[0]) || (is_can2_init && s_err_state_pending[1]))
+  {
+    uint32_t const primask_bit = __get_PRIMASK();
+    __set_PRIMASK(1);
+    if (is_can1_init && s_err_state_pending[0]) fdcan_report_error_state(&fdcan_1);
+    if (is_can2_init && s_err_state_pending[1]) fdcan_report_error_state(&fdcan_2);
+    __set_PRIMASK(primask_bit);
+  }
 
   if (is_can1_init)
   {
@@ -363,6 +401,10 @@ int on_CAN_INIT_Request(FDCAN_HandleTypeDef * handle,
                         uint32_t const data_baud_rate_prescaler, uint32_t const data_time_segment_1,
                         uint32_t const data_time_segment_2, uint32_t const data_sync_jump_width)
 {
+  /* Phase 07.4.42.2: a fresh init starts error-active — drop any report pending from the previous session.
+   * Cleared BEFORE can_init() so a report raised by the new session (IRQ armed in can_internal_init) survives. */
+  s_err_state_pending[(handle == &fdcan_1) ? 0 : 1] = 0;
+
   can_init(handle,
            (handle == &fdcan_1) ? CAN_1 : CAN_2,
            baud_rate_prescaler,
@@ -405,6 +447,9 @@ int on_CAN_DEINIT_Request(FDCAN_HandleTypeDef * handle)
 
   if      (handle == &fdcan_1) is_can1_init = false;
   else if (handle == &fdcan_2) is_can2_init = false;
+
+  /* Phase 07.4.42.2: no error-state retry for a de-initialised controller (IRQ disabled by can_deinit). */
+  s_err_state_pending[(handle == &fdcan_1) ? 0 : 1] = 0;
 
   return 0;
 }
@@ -625,4 +670,11 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
       /* Notification Error */
     }
   }
+}
+
+/* Phase 07.4.42.2 (regenerated 0091): overrides the weak HAL callback; armed in can_internal_init(). */
+void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef * handle, uint32_t ErrorStatusITs)
+{
+  if (ErrorStatusITs & (FDCAN_IT_BUS_OFF | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING))
+    fdcan_report_error_state(handle);
 }

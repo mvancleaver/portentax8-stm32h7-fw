@@ -164,6 +164,13 @@ int can_internal_init(FDCAN_HandleTypeDef * handle)
   if (HAL_FDCAN_ActivateNotification(handle, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_FULL | FDCAN_IT_RX_FIFO0_WATERMARK, 0) != HAL_OK)
     Error_Handler("HAL_FDCAN_ActivateNotification(FDCAN_IT_RX_FIFO0_NEW_MESSAGE) Error_Handler\n");
 
+  /* Phase 07.4.42.2 (regenerated stm32h7-fw 0091 — 7.4.42.1 T3/T4 intent): arm the FDCAN error-state
+   * notifications so HAL_FDCAN_ErrorStatusCallback (can_handler.c) reports bus-off / error-passive /
+   * error-warning transitions (entry AND exit) with TEC/REC to the kernel. Low-rate; both FDCANs. The H7
+   * never self-restarts: recovery is kernel-driven (can_bus_off → restart-ms → OC_DEINIT + OC_INIT). */
+  if (HAL_FDCAN_ActivateNotification(handle, FDCAN_IT_BUS_OFF | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING, 0) != HAL_OK)
+    Error_Handler("HAL_FDCAN_ActivateNotification(FDCAN_IT_BUS_OFF|ERROR_PASSIVE|ERROR_WARNING) Error_Handler\n");
+
   if (HAL_FDCAN_ConfigFifoWatermark(handle, FDCAN_CFG_RX_FIFO0, 2) != HAL_OK)
     Error_Handler("HAL_FDCAN_ConfigFifoWatermark(...) Error_Handler\n");
 
