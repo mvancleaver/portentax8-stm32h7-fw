@@ -20,6 +20,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "stm32h7xx_it.h"
 #include "stm32h7xx_hal.h"
+#include "smart_md_handler.h"  /* Phase 7.4 — htim7_smart_md handle */
 
 /* External variables --------------------------------------------------------*/
 extern FDCAN_HandleTypeDef fdcan_1;
@@ -170,6 +171,16 @@ void USART2_IRQHandler(void) {
  */
 void SPI3_IRQHandler(void) {
   HAL_SPI_IRQHandler(&hspi3);
+}
+
+/**
+ * @brief This function handles TIM7 global interrupt — Phase 7.4 smart-MD
+ *        cache-poll IRQ at 1 kHz. The HAL TIM IRQ handler dispatches to
+ *        HAL_TIM_PeriodElapsedCallback which is overridden in
+ *        src/smart_md_handler.c to call smart_md_cache_refresh_tick().
+ */
+void TIM7_IRQHandler(void) {
+  HAL_TIM_IRQHandler(&htim7_smart_md);
 }
 
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

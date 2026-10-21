@@ -35,6 +35,12 @@ enum Opcodes_H7
   BOOT_M4        = 0x77,
   H7_GET_UID_REQ = 0x78,
   H7_GET_UID_RSP = 0x78,
+  /* Phase 06.2 Plan 03c instrumentation channel — H7-side TX-path traces.
+   * Payload: { uint8_t trace_id; uint8_t v0; uint8_t v1; uint8_t v2; uint8_t v3; }
+   * Linux side: x8h7_drv.c::pkt_parse intercepts (peripheral=PERIPH_H7, opcode=OPCODE_TRACE)
+   * and emits pr_info("[H7-T<id>] ..."). Wire-compatible with all existing
+   * Opcodes_H7 (no overlap). Opcode chosen to be > all current ones. */
+  OPCODE_TRACE   = 0x79,
 };
 
 enum Opcodes_UART

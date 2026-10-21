@@ -58,6 +58,7 @@ DEFINES = \
 
 INCLUDES = \
 	   -Iinclude \
+	   -I../include \
 	   -Ilibraries/STM32H7xx_HAL_Driver/Inc \
 	   -Ilibraries/STM32H7xx_HAL_Driver/Inc/Legacy \
 	   -Ilibraries/CMSIS/Device/ST/STM32H7xx/Include \
@@ -96,6 +97,7 @@ SRCS = \
 	src/system.c \
 	src/watchdog.c \
 	src/h7_handler.c \
+	src/smart_md_handler.c \
 	src/m4_util.c \
 	libraries/openamp_arduino/src/condition.c \
 	libraries/openamp_arduino/src/device.c \

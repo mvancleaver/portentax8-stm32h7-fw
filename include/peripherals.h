@@ -42,6 +42,7 @@ enum Peripherals
   PERIPH_Reserved_1 = 0x08,
   PERIPH_H7 = 0x09,
   PERIPH_VIRTUAL_UART = 0x0A,
+  PERIPH_SMART_MD = 0x0B,    /* Phase 7.4 Plan 02 — smart-MD x8h7 channel */
 };
 
 typedef int(*PeriphCallbackFunc)(uint8_t const opcode, uint8_t const * data, uint16_t const size);

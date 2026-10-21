@@ -34,8 +34,14 @@
  * DEFINE
  **************************************************************************************/
 
-#define X8H7_CAN_HEADER_SIZE        5
-#define X8H7_CAN_FRAME_MAX_DATA_LEN	8
+#define X8H7_CAN_HEADER_SIZE         6
+#define X8H7_CAN_FRAME_MAX_DATA_LEN  64
+
+/* CAN-FD flags byte (byte 5 of x8h7_can_frame_message wire format)
+ * These values are shared with the kernel-side x8h7_can.h -- do NOT renumber. */
+#define X8H7_CAN_FLAG_FD             0x01  /* FDFormat = FDCAN_FD_CAN */
+#define X8H7_CAN_FLAG_BRS            0x02  /* BitRateSwitch = FDCAN_BRS_ON */
+#define X8H7_CAN_FLAG_ESI            0x04  /* ErrorStateIndicator = FDCAN_ESI_PASSIVE */
 
 /* Special address description flags for the CAN_ID */
 #define CAN_EFF_FLAG 0x80000000U /* EFF/SFF is set in the MSB */
@@ -60,14 +66,18 @@ typedef enum {
  * FUNCTION DECLARATION
  **************************************************************************************/
 
-void          can_init(FDCAN_HandleTypeDef * handle, CANName peripheral, uint32_t const baud_rate_prescaler, uint32_t const time_segment_1, uint32_t const time_segment_2, uint32_t const sync_jump_width);
+void          can_init(FDCAN_HandleTypeDef * handle, CANName peripheral,
+                       uint32_t const baud_rate_prescaler, uint32_t const time_segment_1,
+                       uint32_t const time_segment_2, uint32_t const sync_jump_width,
+                       uint32_t const data_baud_rate_prescaler, uint32_t const data_time_segment_1,
+                       uint32_t const data_time_segment_2, uint32_t const data_sync_jump_width);
 void          can_deinit(FDCAN_HandleTypeDef * handle);
 int           can_set_bittiming(FDCAN_HandleTypeDef * handle, uint32_t const baud_rate_prescaler, uint32_t const time_segment_1, uint32_t const time_segment_2, uint32_t const sync_jump_width);
 
 uint32_t      can_tx_fifo_available(FDCAN_HandleTypeDef * handle);
 uint32_t      can_rx_fifo_available(FDCAN_HandleTypeDef * handle, uint32_t const rx_fifo);
-int           can_write(FDCAN_HandleTypeDef * handle, uint32_t const id, uint8_t const len, uint8_t const * data);
-int           can_read(FDCAN_HandleTypeDef * handle, uint32_t * id, uint8_t * len, uint8_t * data);
+int           can_write(FDCAN_HandleTypeDef * handle, uint32_t const id, uint8_t const len, uint8_t const * data, uint8_t const flags);
+int           can_read(FDCAN_HandleTypeDef * handle, uint32_t * id, uint8_t * len, uint8_t * data, uint8_t * flags_out);
 int           can_filter(FDCAN_HandleTypeDef * handle, uint32_t const filter_index, uint32_t const id, uint32_t const mask, bool const is_extended_id);
 unsigned char can_rderror(FDCAN_HandleTypeDef * handle);
 unsigned char can_tderror(FDCAN_HandleTypeDef * handle);

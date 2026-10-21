@@ -23,6 +23,8 @@
 #include "peripherals.h"
 
 #include "debug.h"
+#include "opcodes.h"
+#include "system.h"
 
 /**************************************************************************************
  * DEFINE
@@ -61,6 +63,8 @@ const char* peripheral_to_string(enum Peripherals const peripheral)
       return "VIRTUAL_UART";
     case PERIPH_H7:
       return "FW";
+    case PERIPH_SMART_MD:
+      return "SMART_MD";
     default:
       return "UNKNOWN";
   }
@@ -80,6 +84,16 @@ int peripheral_invoke_callback(uint8_t const peripheral, uint8_t const opcode, u
 
   /* Obtain the registered callback for the selected peripheral. */
   PeriphCallbackFunc const peripheral_callback = PeriphCallbacks[peripheral];
+
+  /* Phase 06.2 Plan 03c — H7-T1 trace. Filter to FDCAN1 only to avoid
+   * recursive/noisy traces from H7/RTC/GPIO peripherals during normal
+   * operation. Payload: trace_id=1, v0=peripheral, v1=opcode, v2/v3=size_lo/hi.
+   * NOTE: enqueue_packet does NOT call peripheral_invoke_callback — no
+   * recursion risk. */
+  if (peripheral == PERIPH_FDCAN1) {
+    uint8_t trace_buf[5] = { 1, peripheral, opcode, (uint8_t)(size & 0xFF), (uint8_t)((size >> 8) & 0xFF) };
+    enqueue_packet(PERIPH_H7, OPCODE_TRACE, sizeof(trace_buf), trace_buf);
+  }
 
   /* Invoke the registered callback for the selected peripheral. */
   int const rc = peripheral_callback(opcode, data, size);

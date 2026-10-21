@@ -377,14 +377,32 @@ void EXTI15_10_IRQHandler(void)
   }
 }
 
-void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+/* Phase 07.4.14 patch 0054 (A4): unified completion-publish helper.
+ * RESEARCH §2 — three sites converge through this:
+ *   1. HAL_SPI_TxRxCpltCallback (normal completion) — refactored below
+ *   2. HAL_SPI_ErrorCallback (error completion) — hardened below (latent bug §2.4)
+ *   3. Any future force-clear path (Stage 1 D-05 watchdog already reverted)
+ * Side-effect: increments s_response_published_total (A4 falsifier; should
+ * be 1:1 with s_md_writes_emitted post-fix per RESEARCH §10.2 G16-bridge). */
+static volatile uint32_t s_response_published_total = 0;
+
+void smart_md_publish_response_done(void)
 {
   struct complete_packet *tx_pkt = (struct complete_packet *)p_tx_buf_transfer;
+  tx_pkt->header.size     = 0;
+  tx_pkt->header.checksum = tx_pkt->header.size ^ 0x5555;
+  s_response_published_total++;
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
   struct complete_packet *rx_pkt = (struct complete_packet *)RX_Buffer;
 
-  /* Limit the amount of data copied to prevent buffer overflow. */
-  if (rx_pkt->header.size > sizeof(rx_pkt_userspace))
-    rx_pkt->header.size = sizeof(rx_pkt_userspace);
+  /* Limit the amount of data copied to prevent buffer overflow.
+   * Phase 06.2 Plan 03c cycle 2 fix: previously used sizeof(rx_pkt_userspace)
+   * which is the POINTER size (4 bytes), not the BUFFER size. */
+  if (rx_pkt->header.size > sizeof(RX_Buffer_userspace))
+    rx_pkt->header.size = sizeof(RX_Buffer_userspace);
 
   /* The SPI transfer is now complete, copy to userspace memory. */
   memcpy((void *)rx_pkt_userspace, &(rx_pkt->data), rx_pkt->header.size);
@@ -392,9 +410,11 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
   /* Mark the next packet as invalid. */
   *((uint32_t*)((uint8_t *)rx_pkt_userspace + rx_pkt->header.size)) = 0xFFFFFFFF;
 
-  /* Clean the transfer buffer size to restart. */
-  tx_pkt->header.size = 0;
-  tx_pkt->header.checksum = tx_pkt->header.size ^ 0x5555;
+  /* Phase 07.4.14 patch 0054 (A4): unified cleanup via helper.
+   * Replaces the inline tx_pkt->header.size = 0; checksum = ... pair (and
+   * the local tx_pkt declaration, no longer needed here) so
+   * HAL_SPI_ErrorCallback below converges on the same site. */
+  smart_md_publish_response_done();
 
   is_rx_buf_userspace_processed = false;
 
@@ -405,6 +425,10 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
   dbg_printf("HAL_SPI_ErrorCallback: spi error code = 0x%lX\n", HAL_SPI_GetError(hspi));
+
+  /* Phase 07.4.14 patch 0054 (A4, RESEARCH §2.4 LATENT BUG fix): error paths
+   * MUST clear tx_pkt state too. Pre-fix this leaked stranded TX state. */
+  smart_md_publish_response_done();
 
   /* Preload buffers for next communication. */
   dma_load(false);
@@ -464,6 +488,13 @@ void dma_handle_data()
       rx_pkt_userspace = (struct subpacket *)RX_Buffer_userspace;
       /* Enable IRQs sent by device again. */
       set_nirq_high();
+      /* Phase 07.4.14 patch 0056 (A6): mark the NIRQ-high start cycle so the
+       * main.c response-signaling block can enforce the minimum 5 µs HIGH
+       * duration before pulling NIRQ low again. RESEARCH §1.4 falsifier
+       * counter `s_nirq_high_pulse_short` increments in main.c when the
+       * busy-wait actually fires. */
+      extern volatile uint32_t s_nirq_high_at_cycles;
+      s_nirq_high_at_cycles = DWT->CYCCNT;
     }
   }
 
