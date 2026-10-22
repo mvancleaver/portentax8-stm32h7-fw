@@ -104,7 +104,7 @@ static volatile uint32_t s_nirq_gate_no_tx_packet           = 0;
 #ifndef X8H7_NIRQ_REPULSE_US
 #define X8H7_NIRQ_REPULSE_US 500u
 #endif
-static volatile uint32_t s_nirq_low_at_cycles   = 0;   /* DWT->CYCCNT when we last pulled NIRQ low */
+volatile uint32_t s_nirq_low_at_cycles   = 0;   /* DWT->CYCCNT when we last pulled NIRQ low (also set by the system.c completion-ISR pulse) */
 volatile uint32_t s_nirq_repulse_total   = 0;   /* re-pulses issued (read by can_handler.c heartbeat) */
 
 /**************************************************************************************
@@ -207,9 +207,15 @@ void handle_data()
       s_nirq_high_at_cycles = 0;
       s_nirq_low_at_cycles  = DWT->CYCCNT;
     }
-    else if (is_nirq_low() && !is_ncs_low() && (tx_data_pending() || s_nirq_low_at_cycles != 0))
+    else if (!is_nirq_low())
     {
-      /* NIRQ asserted, X8 has not started an exchange: after X8H7_NIRQ_REPULSE_US regenerate the edge. */
+      s_nirq_low_at_cycles = 0;   /* 2026-10-22: NIRQ is HIGH (exchange serviced) -> nothing to re-pulse */
+    }
+    else if (!is_ncs_low() && tx_data_pending())
+    {
+      /* NIRQ asserted with data waiting and the X8 has not started an exchange: after X8H7_NIRQ_REPULSE_US
+       * regenerate the edge. (Before 2026-10-22 the timestamp was never cleared, so this fired every 500 us
+       * whenever NIRQ was low — ~1400 pointless edges/s, each costing the X8 an empty 256 B exchange.) */
       uint32_t const cycles_per_us = SystemCoreClock / 1000000u;
       if (s_nirq_low_at_cycles != 0 &&
           (DWT->CYCCNT - s_nirq_low_at_cycles) > (X8H7_NIRQ_REPULSE_US * cycles_per_us))

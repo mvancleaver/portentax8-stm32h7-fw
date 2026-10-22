@@ -459,7 +459,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
     struct complete_packet *armed = (struct complete_packet *)p_tx_buf_transfer;
     if (armed->header.size > 0)
     {
-      extern volatile uint32_t s_nirq_high_at_cycles;
+      extern volatile uint32_t s_nirq_high_at_cycles, s_nirq_low_at_cycles;
       uint32_t const cycles_per_us = SystemCoreClock / 1000000u;
       uint32_t t0;
       /* Never spin on a stopped counter (that hung the H7 under c377782). */
@@ -473,6 +473,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
       while ((DWT->CYCCNT - t0) < (5u * cycles_per_us)) { }
       set_nirq_low();
       s_nirq_high_at_cycles = 0;
+      s_nirq_low_at_cycles  = DWT->CYCCNT;   /* arms the main-loop re-pulse if the X8 is slow to service */
     }
   }
 }

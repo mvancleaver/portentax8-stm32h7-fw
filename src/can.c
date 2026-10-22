@@ -461,19 +461,35 @@ int can_write(FDCAN_HandleTypeDef * handle, uint32_t const id, uint8_t const len
     return 0;
 }
 
+volatile uint32_t s_can_read_errors = 0;   /* 2026-10-22 diag: HAL_FDCAN_GetRxMessage failures (were fatal) */
 int can_read(FDCAN_HandleTypeDef * handle, uint32_t * id, uint8_t * len, uint8_t * data, uint8_t * flags_out)
 {
   static const uint8_t DLCtoBytes[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
 
-  if (HAL_FDCAN_GetRxFifoFillLevel(handle, FDCAN_RX_FIFO0) == 0)
-    return 0; // No message arrived
-
   FDCAN_RxHeaderTypeDef RxHeader = {0};
   uint8_t RxData[64] = {0};
-  if (HAL_FDCAN_GetRxMessage(handle, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+  /* 2026-10-22 (07.4.42.2 bench, H7 boot #2 forensics: IWDG reset, main-loop stage 3 = can_handle_data):
+   * the main loop and HAL_FDCAN_RxFifo0Callback (ISR) both drain FIFO0. Between the fill-level check and
+   * the read the ISR could empty the FIFO, HAL_FDCAN_GetRxMessage then failed (FIFO_EMPTY) and the old
+   * Error_Handler() call here disabled interrupts and spun until the 2 s IWDG reboot -> H7 silent until the
+   * next CAN init (the "transient link silence" that killed the 600 s runs). Check-and-pop atomically, and
+   * never die on a read error: count it and report "nothing". */
   {
-    Error_Handler("HAL_FDCAN_GetRxMessage Error_Handler\n"); // Should not occur as previous HAL_FDCAN_GetRxFifoFillLevel call reported some data
-    return 0;
+    uint32_t const primask_bit = __get_PRIMASK();
+    HAL_StatusTypeDef rc;
+    __set_PRIMASK(1);
+    if (HAL_FDCAN_GetRxFifoFillLevel(handle, FDCAN_RX_FIFO0) == 0)
+    {
+      __set_PRIMASK(primask_bit);
+      return 0; // No message arrived
+    }
+    rc = HAL_FDCAN_GetRxMessage(handle, FDCAN_RX_FIFO0, &RxHeader, RxData);
+    __set_PRIMASK(primask_bit);
+    if (rc != HAL_OK)
+    {
+      s_can_read_errors++;
+      return 0;
+    }
   }
 
   if (RxHeader.IdType == FDCAN_EXTENDED_ID)
