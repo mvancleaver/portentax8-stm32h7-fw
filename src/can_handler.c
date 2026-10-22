@@ -244,10 +244,14 @@ static inline void pace_submit_locked(FDCAN_HandleTypeDef * handle, int const k,
  * previous request's reply was seen or the pacing gap has elapsed. */
 static inline bool pace_may_release_locked(FDCAN_HandleTypeDef * handle, int const k)
 {
+  /* "Wire free" is the hardware's word (TXBRP: pending request bits), not a software flag — the reply's
+   * RX interrupt can be serviced in the same IRQ pass BEFORE the TX-complete callback, and a software
+   * "busy" flag would then veto the release until the main loop noticed (~1 ms: bench 2026-10-22, second
+   * prodmix run throttled to ~970 requests/s). */
   if (handle->Instance->TXBRP != 0u) return false;                 /* previous request still on the wire */
-  if (s_pace_hw_busy[k]) return false;                             /* completion ISR has not run yet */
   if (s_pace_released[k] == 0u) return true;                       /* first request ever */
   if (s_pace_reply_seen[k]) return true;                           /* the reply is in: bus is ours again */
+  if (s_pace_hw_busy[k]) return false;                             /* TX-complete not yet seen: gap clock not started */
   return (DWT->CYCCNT - s_pace_last_tx_done_cyc[k]) >= pace_gap_cycles();
 }
 
@@ -854,6 +858,7 @@ void HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef * handle, uint32_t B
   /* 07.4.42.2 request pacing: the wire is free from now; the next request is released by the RX ISR
    * (reply) or by the main loop once the gap elapsed. */
   pace_on_tx_done(handle);
+  fdcan_tx_pace_service(handle);   /* the reply may already have been seen in this IRQ pass: release now */
 
   /* Phase 07.4.42.2 (P0-4): count-based report; BufferIndexes (sticky TXBTO & TXBTIE) is not used for accounting. */
   uint32_t const reported = fdcan_report_tx_finished(handle);
