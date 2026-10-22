@@ -333,9 +333,13 @@ int can_handle_data()
   s_hb_loops++;
   if (is_can2_init && (uint32_t)(now - s_hb_last_ms) >= 100u)
   {
-    uint8_t hb[8] = { X8H7_CAN_STS_INT_HEARTBEAT, s_hb_seq, (uint8_t)s_hb_loops, (uint8_t)s_tx_submitted[1],
-                      (uint8_t)s_tx_reported[1], (uint8_t)s_rx_frames[1], (uint8_t)s_nirq_repulse_total,
-                      (uint8_t)s_spi_error_callbacks };
+    /* v2 (16-bit counters; 8-bit ones wrapped within one 100 ms period): little-endian u16 fields */
+    uint16_t const f[5] = { (uint16_t)s_hb_loops, (uint16_t)s_spi_error_callbacks, (uint16_t)s_rx_frames[1],
+                            (uint16_t)s_tx_submitted[1], (uint16_t)s_nirq_repulse_total };
+    uint8_t hb[12] = { X8H7_CAN_STS_INT_HEARTBEAT, s_hb_seq,
+                       (uint8_t)f[0], (uint8_t)(f[0] >> 8), (uint8_t)f[1], (uint8_t)(f[1] >> 8),
+                       (uint8_t)f[2], (uint8_t)(f[2] >> 8), (uint8_t)f[3], (uint8_t)(f[3] >> 8),
+                       (uint8_t)f[4], (uint8_t)(f[4] >> 8) };
     if (enqueue_packet(PERIPH_FDCAN2, CAN_STATUS, sizeof(hb), hb)) { s_hb_seq++; s_hb_last_ms = now; }
   }
 
