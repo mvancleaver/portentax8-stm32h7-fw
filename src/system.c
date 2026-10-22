@@ -446,11 +446,11 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
   (void)hspi;
 #endif
 
-  /* Phase 07.4.14 patch 0054 (A4, RESEARCH §2.4 LATENT BUG fix): error paths
-   * MUST clear tx_pkt state too. Pre-fix this leaked stranded TX state. */
-  smart_md_publish_response_done();
-
-  /* Preload buffers for next communication. */
+  /* 2026-10-22: do NOT zero the transfer buffer here (patch 0054 did). An SPI error means the
+   * master clocked an exchange while our DMA was not armed (overrun): nothing of ours went out
+   * and nothing of theirs is valid. Re-arm the SAME transfer buffer so its TX_COMPLETE / RX
+   * frames go out on the next exchange instead of being lost (every loss stalls the kernel ring).
+   * The RX side of this exchange is discarded by not touching is_rx_buf_userspace_processed. */
   dma_load(false);
   set_nirq_high();
 }
