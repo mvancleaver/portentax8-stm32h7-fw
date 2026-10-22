@@ -178,6 +178,101 @@ void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle);
  * reported as {INT_ERR, RX_OVR, n_lost} once per main-loop pass. Zeroed by fdcan_tx_accounting_reset(). */
 static volatile uint32_t s_rx_lost[2], s_rx_lost_reported[2];
 
+/* ------------------------------------------------------------------------------------------
+ * 07.4.42.2 bench 2026-10-22 — REQUEST PACING ("one request on the bus at a time").
+ *
+ * Finding (HUMAN-UAT item 8, all six fleet MD80s on the gantry): when the kernel batches several
+ * requests into one SPI packet, this handler pushed them all into the FDCAN TX FIFO and the
+ * hardware sent them back-to-back. An MD80 reply is single-shot: if it meets the next request
+ * on the bus it is lost (6 back-to-back requests -> the 2nd motor never answered, 0/40;
+ * a single motor given 6 back-to-back requests answered ~1 of 6; the same requests spaced one
+ * per SPI exchange -> 40/40 for every motor). The CANdle USB device never does this: it is a
+ * strict master/slave bridge. So the X8 must be too, and the only place with microsecond
+ * control of the wire is here:
+ *   - at most ONE request is in the hardware TX FIFO at a time (per FDCAN instance);
+ *   - the next request is released only after the previous one completed AND either an RX
+ *     frame (the reply) arrived since, or X8H7_TX_PACE_GAP_US elapsed (dead motor / no reply);
+ *   - requests the kernel delivers meanwhile wait in a per-instance software ring. They are
+ *     NOT counted as submitted until released, so the kernel ring keeps them in flight and the
+ *     count-based TX_COMPLETE accounting (fdcan_report_tx_finished) is unchanged.
+ * Cost: ~60 us request + reply (~75 us for a 24-byte 0xA0 at 5M) + motor latency, about
+ * 150-200 us per motor, ~1 ms for six at 500 Hz. The old "abort the oldest element" path is
+ * kept for the (now unreachable) case of a full hardware FIFO.
+ * ------------------------------------------------------------------------------------------ */
+#ifndef X8H7_TX_PACE_GAP_US
+#define X8H7_TX_PACE_GAP_US 150u
+#endif
+#define X8H7_TX_PACE_DEPTH 32u
+typedef struct
+{
+  uint32_t id;
+  uint8_t  len;
+  uint8_t  flags;
+  uint8_t  data[X8H7_CAN_FRAME_MAX_DATA_LEN];
+} x8h7_tx_pace_elem_t;
+static x8h7_tx_pace_elem_t s_pace_ring[2][X8H7_TX_PACE_DEPTH];
+static volatile uint32_t s_pace_head[2], s_pace_tail[2];      /* consumer / producer indices (free-running) */
+static volatile uint32_t s_pace_last_tx_done_cyc[2];          /* DWT->CYCCNT at the last TX complete/abort */
+static volatile uint8_t  s_pace_reply_seen[2];                /* an RX frame arrived since the last release */
+static volatile uint8_t  s_pace_hw_busy[2];                   /* a released request has not completed yet */
+static volatile uint32_t s_pace_released[2], s_pace_queued[2], s_pace_rejected[2];   /* diag counters */
+
+static inline uint32_t pace_gap_cycles(void)
+{
+  return (SystemCoreClock / 1000000u) * X8H7_TX_PACE_GAP_US;
+}
+
+static inline void pace_dwt_enable(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+/* Submit one request to the hardware FIFO and count it (caller holds PRIMASK=1). */
+static inline void pace_submit_locked(FDCAN_HandleTypeDef * handle, int const k,
+                                      uint32_t const id, uint8_t const len, uint8_t const * data, uint8_t const flags)
+{
+  int const rc = can_write(handle, id, len, data, flags);
+  s_tx_submitted[k]++;
+  if (rc < 0) s_tx_aborted[k]++;   /* submit failed: finished + aborted (never set TXBRP) */
+  s_pace_hw_busy[k]    = (rc < 0) ? 0u : 1u;
+  s_pace_reply_seen[k] = 0u;
+  s_pace_released[k]++;
+}
+
+/* True when a new request may go to the hardware now: nothing pending in TXBRP, and the
+ * previous request's reply was seen or the pacing gap has elapsed. */
+static inline bool pace_may_release_locked(FDCAN_HandleTypeDef * handle, int const k)
+{
+  if (handle->Instance->TXBRP != 0u) return false;                 /* previous request still on the wire */
+  if (s_pace_hw_busy[k]) return false;                             /* completion ISR has not run yet */
+  if (s_pace_released[k] == 0u) return true;                       /* first request ever */
+  if (s_pace_reply_seen[k]) return true;                           /* the reply is in: bus is ours again */
+  return (DWT->CYCCNT - s_pace_last_tx_done_cyc[k]) >= pace_gap_cycles();
+}
+
+/* Release the next queued request if pacing allows. Safe from ISR and main loop. */
+static void fdcan_tx_pace_service(FDCAN_HandleTypeDef * handle)
+{
+  int const k = (handle == &fdcan_1) ? 0 : 1;
+  uint32_t const pm = __get_PRIMASK(); __set_PRIMASK(1);
+  if (s_pace_head[k] != s_pace_tail[k] && pace_may_release_locked(handle, k))
+  {
+    x8h7_tx_pace_elem_t const * e = &s_pace_ring[k][s_pace_head[k] % X8H7_TX_PACE_DEPTH];
+    pace_submit_locked(handle, k, e->id, e->len, e->data, e->flags);
+    s_pace_head[k]++;
+  }
+  __set_PRIMASK(pm);
+}
+
+/* TX complete / abort: the wire is free; start the gap clock. */
+static inline void pace_on_tx_done(FDCAN_HandleTypeDef * handle)
+{
+  int const k = (handle == &fdcan_1) ? 0 : 1;
+  s_pace_last_tx_done_cyc[k] = DWT->CYCCNT;
+  s_pace_hw_busy[k] = 0u;
+}
+
 /* Report the CURRENT FDCAN error state as {INT_ERR, flags, TEC, REC} (wire contract row "error state").
  * flags come from PSR, not from the interrupt bits, because EP/EW/BO interrupts fire on both entry and exit.
  * Called from HAL_FDCAN_ErrorStatusCallback (FDCANx_IT0 ISR) and, for a pending retry, from can_handle_data()
@@ -215,6 +310,12 @@ void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle)
   s_tx_aborted_reported[k] = 0;
   s_rx_lost[k] = 0;
   s_rx_lost_reported[k] = 0;
+  /* 07.4.42.2 request pacing: drop whatever was queued (the kernel ring is reset on INIT too). */
+  pace_dwt_enable();
+  s_pace_head[k] = 0; s_pace_tail[k] = 0;
+  s_pace_hw_busy[k] = 0; s_pace_reply_seen[k] = 0;
+  s_pace_released[k] = 0; s_pace_queued[k] = 0; s_pace_rejected[k] = 0;
+  s_pace_last_tx_done_cyc[k] = DWT->CYCCNT;
   __set_PRIMASK(primask_bit);
 }
 
@@ -322,6 +423,10 @@ int can_handle_data()
    * a lost TX_COMPLETE status must not wedge the kernel ring. No-op (one TXBRP read) when nothing is new. */
   if (is_can1_init) (void)fdcan_report_tx_finished(&fdcan_1);
   if (is_can2_init) (void)fdcan_report_tx_finished(&fdcan_2);
+
+  /* 07.4.42.2 request pacing: release the next queued request once the gap elapsed (no reply case). */
+  if (is_can1_init) fdcan_tx_pace_service(&fdcan_1);
+  if (is_can2_init) fdcan_tx_pace_service(&fdcan_2);
 
   if (is_can1_init)
   {
@@ -629,13 +734,31 @@ int on_CAN_TX_FRAME_Request(FDCAN_HandleTypeDef * handle, union x8h7_can_frame_m
     return 0;
   }
 
-  /* Submit and count atomically: no TX ISR may compute submitted - popcount(TXBRP) between the TXBAR write and
-   * the increment. A failed can_write never set TXBRP, so counting it as submitted (+ aborted) makes it
-   * "finished" immediately. */
+  /* 07.4.42.2 request pacing (see the block above s_pace_ring): the request goes to the hardware only
+   * if nothing is on the wire and the previous reply was seen (or the gap elapsed); otherwise it waits in
+   * the software ring and fdcan_tx_pace_service() releases it from the RX ISR (reply arrived), the TX
+   * complete ISR or the main loop (gap timeout). Submit + count stay atomic (PRIMASK) as before. */
+  int rc = 0;
   uint32_t const pm = __get_PRIMASK(); __set_PRIMASK(1);
-  int const rc = can_write(handle, msg->field.id, msg->field.len, msg->field.data, msg->field.flags);
-  s_tx_submitted[k]++;
-  if (rc < 0) s_tx_aborted[k]++;   /* submit failed: finished + aborted */
+  if (s_pace_head[k] == s_pace_tail[k] && pace_may_release_locked(handle, k))
+  {
+    pace_submit_locked(handle, k, msg->field.id, msg->field.len, msg->field.data, msg->field.flags);
+    rc = (s_pace_hw_busy[k]) ? 0 : -1;
+  }
+  else if ((s_pace_tail[k] - s_pace_head[k]) < X8H7_TX_PACE_DEPTH)
+  {
+    x8h7_tx_pace_elem_t * e = &s_pace_ring[k][s_pace_tail[k] % X8H7_TX_PACE_DEPTH];
+    e->id = msg->field.id; e->len = msg->field.len; e->flags = msg->field.flags;
+    memcpy(e->data, msg->field.data, (msg->field.len <= X8H7_CAN_FRAME_MAX_DATA_LEN) ? msg->field.len : X8H7_CAN_FRAME_MAX_DATA_LEN);
+    s_pace_tail[k]++;
+    s_pace_queued[k]++;
+  }
+  else
+  {
+    /* Software ring full (kernel ring is 16 deep, so this is a fault path): reject = finished + aborted. */
+    s_tx_submitted[k]++; s_tx_aborted[k]++; s_pace_rejected[k]++;
+    rc = -1;
+  }
   __set_PRIMASK(pm);
 
   /* Phase 06.3 cycle 6 — H7-T12 trace. Dumps FDCAN1 PSR/CCCR/TXBRP/TXFQS
@@ -728,6 +851,10 @@ void HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef * handle, uint32_t B
   }
 #endif
 
+  /* 07.4.42.2 request pacing: the wire is free from now; the next request is released by the RX ISR
+   * (reply) or by the main loop once the gap elapsed. */
+  pace_on_tx_done(handle);
+
   /* Phase 07.4.42.2 (P0-4): count-based report; BufferIndexes (sticky TXBTO & TXBTIE) is not used for accounting. */
   uint32_t const reported = fdcan_report_tx_finished(handle);
   (void)reported;  /* consumed only by H7-T6 trace below when DEBUG_H7_TX_TRACE */
@@ -749,7 +876,9 @@ void HAL_FDCAN_TxBufferAbortCallback(FDCAN_HandleTypeDef * handle, uint32_t Buff
   /* Phase 07.4.42.2 (P0-4/P1-3): an aborted element is reported in the TX finished count (as aborted);
    * the new firmware no longer sends the legacy per-mask TX_ABORT_COMPLETE status. */
   (void)BufferIndexes;
+  pace_on_tx_done(handle);
   (void)fdcan_report_tx_finished(handle);
+  fdcan_tx_pace_service(handle);   /* an aborted request frees the wire without a reply: next one may go after the gap */
 }
 
 void HAL_FDCAN_TxFifoEmptyCallback(FDCAN_HandleTypeDef * handle)
@@ -769,6 +898,11 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
   /* Phase 07.4.42.2 (P1-1): RF0L — the FIFO was full and a frame was discarded (blocking mode). Armed in
    * can_internal_init(); one count per interrupt (episode), reported by can_handle_data(). */
   if (RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) s_rx_lost[k]++;
+
+  /* 07.4.42.2 request pacing: a frame came in (the reply to the request on the wire): the bus is free
+   * for the next queued request. Set the flag before draining so the release does not wait for the gap. */
+  s_pace_reply_seen[k] = 1u;
+  fdcan_tx_pace_service(hfdcan);
 
   /* Phase 07.4.6 (patch 0038) — also drain on NEW_MESSAGE so smart-MD
    * responses (typically 1 frame at a time, well under the watermark=2
