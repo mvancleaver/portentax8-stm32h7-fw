@@ -21,6 +21,7 @@
  **************************************************************************************/
 
 #include "can_handler.h"
+#include "crash_diag.h"
 
 #include <string.h>
 
@@ -336,10 +337,19 @@ int can_handle_data()
     /* v2 (16-bit counters; 8-bit ones wrapped within one 100 ms period): little-endian u16 fields */
     uint16_t const f[5] = { (uint16_t)s_hb_loops, (uint16_t)s_spi_error_callbacks, (uint16_t)s_rx_frames[1],
                             (uint16_t)s_tx_submitted[1], (uint16_t)s_nirq_repulse_total };
-    uint8_t hb[12] = { X8H7_CAN_STS_INT_HEARTBEAT, s_hb_seq,
+    /* v3 (2026-10-22): + boot report tail {reset_cause16, fault_kind8, last_stage8, pc32, lr32, cfsr32, hfsr32,
+     * addr32, boot_count16} = 26 B (constant for the life of this boot; the kernel prints it when boot_count changes). */
+    struct crash_record const *cr = crash_diag_last_fault();
+    uint16_t const rc16 = crash_diag_reset_cause(), bc16 = crash_diag_boot_count();
+    uint32_t const w[5] = { cr->pc, cr->lr, cr->cfsr, cr->hfsr, cr->addr };
+    uint8_t hb[38] = { X8H7_CAN_STS_INT_HEARTBEAT, s_hb_seq,
                        (uint8_t)f[0], (uint8_t)(f[0] >> 8), (uint8_t)f[1], (uint8_t)(f[1] >> 8),
                        (uint8_t)f[2], (uint8_t)(f[2] >> 8), (uint8_t)f[3], (uint8_t)(f[3] >> 8),
-                       (uint8_t)f[4], (uint8_t)(f[4] >> 8) };
+                       (uint8_t)f[4], (uint8_t)(f[4] >> 8),
+                       (uint8_t)rc16, (uint8_t)(rc16 >> 8), cr->kind, crash_diag_last_stage() };
+    for (int i = 0; i < 5; i++) { hb[16 + 4 * i] = (uint8_t)w[i]; hb[17 + 4 * i] = (uint8_t)(w[i] >> 8);
+                                  hb[18 + 4 * i] = (uint8_t)(w[i] >> 16); hb[19 + 4 * i] = (uint8_t)(w[i] >> 24); }
+    hb[36] = (uint8_t)bc16; hb[37] = (uint8_t)(bc16 >> 8);
     if (enqueue_packet(PERIPH_FDCAN2, CAN_STATUS, sizeof(hb), hb)) { s_hb_seq++; s_hb_last_ms = now; }
   }
 

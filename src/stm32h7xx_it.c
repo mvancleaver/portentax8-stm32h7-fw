@@ -20,6 +20,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "stm32h7xx_it.h"
 #include "stm32h7xx_hal.h"
+#include "crash_diag.h"
 #include "smart_md_handler.h"  /* Phase 7.4 — htim7_smart_md handle */
 
 /* External variables --------------------------------------------------------*/
@@ -36,49 +37,71 @@ extern UART_HandleTypeDef huart2;
 /**
  * @brief This function handles Non maskable interrupt.
  */
-void NMI_Handler(void) {
-  while (1) {
-  }
+__attribute__((naked)) void NMI_Handler(void) {
+  /* 2026-10-22 crash_diag: select the faulting stack, record registers, reset (no 2 s IWDG wait). */
+  __asm volatile(
+    "tst lr, #4          \n"
+    "ite eq              \n"
+    "mrseq r0, msp       \n"
+    "mrsne r0, psp       \n"
+    "mov r1, #5          \n"
+    "b crash_diag_fault  \n");
 }
 
 /**
  * @brief This function handles Hard fault interrupt.
  */
-void HardFault_Handler(void) {
-  while (1) {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
+__attribute__((naked)) void HardFault_Handler(void) {
+  /* 2026-10-22 crash_diag: select the faulting stack, record registers, reset (no 2 s IWDG wait). */
+  __asm volatile(
+    "tst lr, #4          \n"
+    "ite eq              \n"
+    "mrseq r0, msp       \n"
+    "mrsne r0, psp       \n"
+    "mov r1, #1          \n"
+    "b crash_diag_fault  \n");
 }
 
 /**
  * @brief This function handles Memory management fault.
  */
-void MemManage_Handler(void) {
-  while (1) {
-    /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
-    /* USER CODE END W1_MemoryManagement_IRQn 0 */
-  }
+__attribute__((naked)) void MemManage_Handler(void) {
+  /* 2026-10-22 crash_diag: select the faulting stack, record registers, reset (no 2 s IWDG wait). */
+  __asm volatile(
+    "tst lr, #4          \n"
+    "ite eq              \n"
+    "mrseq r0, msp       \n"
+    "mrsne r0, psp       \n"
+    "mov r1, #2          \n"
+    "b crash_diag_fault  \n");
 }
 
 /**
  * @brief This function handles Pre-fetch fault, memory access fault.
  */
-void BusFault_Handler(void) {
-  while (1) {
-    /* USER CODE BEGIN W1_BusFault_IRQn 0 */
-    /* USER CODE END W1_BusFault_IRQn 0 */
-  }
+__attribute__((naked)) void BusFault_Handler(void) {
+  /* 2026-10-22 crash_diag: select the faulting stack, record registers, reset (no 2 s IWDG wait). */
+  __asm volatile(
+    "tst lr, #4          \n"
+    "ite eq              \n"
+    "mrseq r0, msp       \n"
+    "mrsne r0, psp       \n"
+    "mov r1, #3          \n"
+    "b crash_diag_fault  \n");
 }
 
 /**
  * @brief This function handles Undefined instruction or illegal state.
  */
-void UsageFault_Handler(void) {
-  while (1) {
-    /* USER CODE BEGIN W1_UsageFault_IRQn 0 */
-    /* USER CODE END W1_UsageFault_IRQn 0 */
-  }
+__attribute__((naked)) void UsageFault_Handler(void) {
+  /* 2026-10-22 crash_diag: select the faulting stack, record registers, reset (no 2 s IWDG wait). */
+  __asm volatile(
+    "tst lr, #4          \n"
+    "ite eq              \n"
+    "mrseq r0, msp       \n"
+    "mrsne r0, psp       \n"
+    "mov r1, #4          \n"
+    "b crash_diag_fault  \n");
 }
 
 /**

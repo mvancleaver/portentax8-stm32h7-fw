@@ -41,6 +41,7 @@
 #include "rtc_handler.h"
 #include "spi.h"
 #include "system.h"
+#include "crash_diag.h"
 #include "h7_handler.h"
 #include "smart_md_handler.h"
 #include "watchdog.h"
@@ -163,15 +164,21 @@ void handle_data()
    * protocol state machine; FDCAN2 RX FIFO0 drain is owned by the
    * existing can_handle_data() path (gated `!smart_md_is_active()`). */
 
+  crash_diag_stage(1);
   if (uart_data_available())
     uart_handle_data();
 
+  crash_diag_stage(2);
   if (virtual_uart_data_available())
     virtual_uart_handle_data();
 
+  crash_diag_stage(3);
   can_handle_data();
+  crash_diag_stage(4);
   gpio_handle_data();
+  crash_diag_stage(5);
   dma_handle_data();
+  crash_diag_stage(6);
 
   {
     /* Enter critical section. */
@@ -239,6 +246,7 @@ static void dwt_cycle_counter_init(void)
 
 int main(void)
 {
+  crash_diag_boot_capture();   /* before anything can fault; reads/clears the previous crash record */
   dwt_cycle_counter_init();
   gpio_init_nirq();
 

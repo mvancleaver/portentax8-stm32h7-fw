@@ -71,6 +71,7 @@ INCLUDES = \
 SRCS = \
 	src/system_stm32h7xx_dualcore_boot_cm4_cm7.c \
 	src/main.c \
+	src/crash_diag.c \
 	src/can.c \
 	src/can_handler.c \
 	src/error_handler.c \
