@@ -225,8 +225,21 @@ void handle_data()
  * MAIN
  **************************************************************************************/
 
+/* 2026-10-22: the DWT cycle counter was only ever enabled inside smart_md_handler_init() (patch 0033),
+ * which Arch-B patch 0080 removed from peripheral_init(). Since then DWT->CYCCNT read 0 under Arch-B:
+ * the patch-0056 5 us NIRQ-HIGH hold guard and the X8H7_NIRQ_REPULSE_US re-pulse below were silent
+ * no-ops, and the completion-ISR NIRQ pulse (system.c, c377782) busy-waited forever and hung the H7.
+ * Enable it unconditionally before any SPI/DMA activity. */
+static void dwt_cycle_counter_init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
 int main(void)
 {
+  dwt_cycle_counter_init();
   gpio_init_nirq();
 
   system_init();

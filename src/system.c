@@ -462,6 +462,12 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
       extern volatile uint32_t s_nirq_high_at_cycles;
       uint32_t const cycles_per_us = SystemCoreClock / 1000000u;
       uint32_t t0;
+      /* Never spin on a stopped counter (that hung the H7 under c377782). */
+      if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0u)
+      {
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+        DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+      }
       set_nirq_high();
       t0 = DWT->CYCCNT;
       while ((DWT->CYCCNT - t0) < (5u * cycles_per_us)) { }
