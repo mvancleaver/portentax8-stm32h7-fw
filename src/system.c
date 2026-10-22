@@ -451,6 +451,24 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
    * that accumulated data since the previous completion; NIRQ (main.c) is a pure "data waiting" signal.
    * Cost: an H7->X8 item leaves one exchange later than before. */
   dma_load(true);
+
+  /* 2026-10-22: if the buffer just armed holds data, tell the master NOW (from this ISR) instead of
+   * waiting for the main loop (which may sit in WFI for up to a SysTick): NIRQ HIGH >= 5 us (patch 0056
+   * minimum the i.MX8 edge detector needs), then LOW. The main loop's later HIGH/LOW re-signal is harmless. */
+  {
+    struct complete_packet *armed = (struct complete_packet *)p_tx_buf_transfer;
+    if (armed->header.size > 0)
+    {
+      extern volatile uint32_t s_nirq_high_at_cycles;
+      uint32_t const cycles_per_us = SystemCoreClock / 1000000u;
+      uint32_t t0;
+      set_nirq_high();
+      t0 = DWT->CYCCNT;
+      while ((DWT->CYCCNT - t0) < (5u * cycles_per_us)) { }
+      set_nirq_low();
+      s_nirq_high_at_cycles = 0;
+    }
+  }
 }
 
 /* 2026-10-22: SPI error-path prints go to the console UART (115200) from interrupt context — tens of
