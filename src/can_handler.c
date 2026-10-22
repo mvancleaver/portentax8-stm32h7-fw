@@ -57,6 +57,7 @@
 #define X8H7_CAN_STS_INT_ERR               0x04
 #define X8H7_CAN_STS_INT_TX_ABORT_COMPLETE 0x08
 #define X8H7_CAN_STS_INT_TX_FIFO_EMPTY     0x10
+#define X8H7_CAN_STS_INT_HEARTBEAT         0x20  /* 2026-10-22 diag: {0x20, seq, loop8, txsub8, txrep8, rxfr8, repulse8, spierr8} every 100 ms */
 
 /* Phase 07.4.5 (patch 0036) — compile-gate the Phase 06.2 Plan 03c H7-T5/T6
  * OPCODE_TRACE emits.  These debug traces fire on every FDCAN TX completion
@@ -177,6 +178,10 @@ void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle);
  * SPI payload was full). Incremented by the RX FIFO0 ISR and (PRIMASK-guarded) by the can_handle_data() drain;
  * reported as {INT_ERR, RX_OVR, n_lost} once per main-loop pass. Zeroed by fdcan_tx_accounting_reset(). */
 static volatile uint32_t s_rx_lost[2], s_rx_lost_reported[2];
+static volatile uint32_t s_rx_frames[2];                 /* 2026-10-22 diag: frames drained from FIFO0 (ISR + main loop) */
+static uint32_t s_hb_loops = 0, s_hb_last_ms = 0; static uint8_t s_hb_seq = 0;
+extern volatile uint32_t s_nirq_repulse_total;           /* main.c */
+extern volatile uint32_t s_spi_error_callbacks;          /* system.c */
 
 /* Report the CURRENT FDCAN error state as {INT_ERR, flags, TEC, REC} (wire contract row "error state").
  * flags come from PSR, not from the interrupt bits, because EP/EW/BO interrupts fire on both entry and exit.
@@ -322,6 +327,17 @@ int can_handle_data()
    * a lost TX_COMPLETE status must not wedge the kernel ring. No-op (one TXBRP read) when nothing is new. */
   if (is_can1_init) (void)fdcan_report_tx_finished(&fdcan_1);
   if (is_can2_init) (void)fdcan_report_tx_finished(&fdcan_2);
+
+  /* 2026-10-22 diag heartbeat (FDCAN2 status channel, 8 B every 100 ms): lets the kernel tell an H7 that
+   * stopped iterating from an H7 that iterates but sees no bus traffic. Costs 12 B / 100 ms of SPI payload. */
+  s_hb_loops++;
+  if (is_can2_init && (uint32_t)(now - s_hb_last_ms) >= 100u)
+  {
+    uint8_t hb[8] = { X8H7_CAN_STS_INT_HEARTBEAT, s_hb_seq, (uint8_t)s_hb_loops, (uint8_t)s_tx_submitted[1],
+                      (uint8_t)s_tx_reported[1], (uint8_t)s_rx_frames[1], (uint8_t)s_nirq_repulse_total,
+                      (uint8_t)s_spi_error_callbacks };
+    if (enqueue_packet(PERIPH_FDCAN2, CAN_STATUS, sizeof(hb), hb)) { s_hb_seq++; s_hb_last_ms = now; }
+  }
 
   if (is_can1_init)
   {
@@ -796,6 +812,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
        * x8h7_can queue below is unchanged for non-smart-MD bus traffic. */
 
       int ret = enqueue_packet(hfdcan == &fdcan_1 ? PERIPH_FDCAN1 : PERIPH_FDCAN2, CAN_RX_FRAME, X8H7_CAN_HEADER_SIZE + x8h7_msg.field.len, x8h7_msg.buf);
+      if (ret) s_rx_frames[k]++;
       if (ret == 0) { s_rx_lost[k]++; break; }   /* 07.4.42.2 P1-1: popped but not forwarded — lost */
 
       /* Phase 07.3 Plan 03 patch 0024 — ISR-side hook for the cs8h7-can

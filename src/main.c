@@ -104,7 +104,7 @@ static volatile uint32_t s_nirq_gate_no_tx_packet           = 0;
 #define X8H7_NIRQ_REPULSE_US 500u
 #endif
 static volatile uint32_t s_nirq_low_at_cycles   = 0;   /* DWT->CYCCNT when we last pulled NIRQ low */
-static volatile uint32_t s_nirq_repulse_total   = 0;   /* re-pulses issued */
+volatile uint32_t s_nirq_repulse_total   = 0;   /* re-pulses issued (read by can_handler.c heartbeat) */
 
 /**************************************************************************************
  * FUNCTION DEFINITION
