@@ -199,6 +199,15 @@ static volatile uint32_t s_rx_lost[2], s_rx_lost_reported[2];
  * 150-200 us per motor, ~1 ms for six at 500 Hz. The old "abort the oldest element" path is
  * kept for the (now unreachable) case of a full hardware FIFO.
  * ------------------------------------------------------------------------------------------ */
+/* X8H7_TX_PACE_ENABLE: 0 (default since 2026-10-22 06:50) = requests go straight to the hardware FIFO as before
+ * the pacer existed. The pacer turned out unnecessary once (a) the X8 sends its fan-out in ascending CAN-id
+ * order (a pending reply then always wins arbitration against the next request) and (b) the kernel TX path
+ * runs on a SCHED_FIFO kthread (the real cause of the ENOBUFS/stale symptoms was that thread being starved).
+ * Strict one-outstanding pacing costs ~60 us + reply latency per request and cannot sustain 6 x 500 Hz with
+ * enabled motors. Kept behind the switch for buses whose slaves cannot tolerate overlapped requests. */
+#ifndef X8H7_TX_PACE_ENABLE
+#define X8H7_TX_PACE_ENABLE 0
+#endif
 #ifndef X8H7_TX_PACE_GAP_US
 #define X8H7_TX_PACE_GAP_US 500u   /* bench 2026-10-22: 150 us released the next request before a ~140-250 us reply and lost it; 500 us only matters for a motor that never answers */
 #endif
@@ -250,6 +259,10 @@ static inline void pace_submit_locked(FDCAN_HandleTypeDef * handle, int const k,
  * previous request's reply was seen or the pacing gap has elapsed. */
 static inline bool pace_may_release_locked(FDCAN_HandleTypeDef * handle, int const k)
 {
+#if !X8H7_TX_PACE_ENABLE
+  (void)handle; (void)k;
+  return true;   /* pacing off: never hold a request back */
+#endif
   /* "Wire free" is the hardware's word (TXBRP: pending request bits), not a software flag — the reply's
    * RX interrupt can be serviced in the same IRQ pass BEFORE the TX-complete callback, and a software
    * "busy" flag would then veto the release until the main loop noticed (~1 ms: bench 2026-10-22, second
