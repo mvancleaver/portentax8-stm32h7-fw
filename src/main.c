@@ -184,7 +184,7 @@ void handle_data()
      * s_nirq_already_low_at_handshake increment (patch 0050) DELETED with
      * the smart-md ENABLE-pathway; their BSS counters remain declared
      * above (D-A3 carry-forward) but read 0 at runtime now. */
-    if (!is_nirq_low() && !is_ncs_low() && (get_tx_packet_size() > 0))
+    if (!is_nirq_low() && !is_ncs_low() && tx_data_pending())
     {
       /* Phase 07.4.14 patch 0056 (A6): enforce minimum 5 µs NIRQ HIGH
        * duration before pulling LOW. 2000u = 5 µs * 400 MHz CPU clock. */
@@ -194,12 +194,13 @@ void handle_data()
           s_nirq_high_pulse_short++;
         }
       }
-      dma_load(true);
+      /* 2026-10-22: NO dma_load(true) here any more — the DMA is armed only at exchange completion
+       * (system.c HAL_SPI_TxRxCpltCallback); NIRQ just tells the master data is waiting. */
       set_nirq_low();
       s_nirq_high_at_cycles = 0;
       s_nirq_low_at_cycles  = DWT->CYCCNT;
     }
-    else if (is_nirq_low() && !is_ncs_low() && (get_tx_packet_size() > 0 || s_nirq_low_at_cycles != 0))
+    else if (is_nirq_low() && !is_ncs_low() && (tx_data_pending() || s_nirq_low_at_cycles != 0))
     {
       /* NIRQ asserted, X8 has not started an exchange: after X8H7_NIRQ_REPULSE_US regenerate the edge. */
       uint32_t const cycles_per_us = SystemCoreClock / 1000000u;

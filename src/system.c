@@ -331,6 +331,14 @@ uint16_t get_tx_packet_size()
   return tx_packet_size;
 }
 
+/* 2026-10-22: data waiting in EITHER buffer (armed transfer buffer or the accumulating active one). */
+bool tx_data_pending(void)
+{
+  struct complete_packet * a = (struct complete_packet *)p_tx_buf_active;
+  struct complete_packet * x = (struct complete_packet *)p_tx_buf_transfer;
+  return (a->header.size > 0) || (x->header.size > 0);
+}
+
 void system_init() {
 
   MPU_Config();
@@ -356,7 +364,10 @@ extern SPI_HandleTypeDef hspi3;
 volatile uint32_t s_dma_load_failures = 0;
 void dma_load(bool const swap_tx_buf)
 {
-  HAL_SPI_Abort(&hspi3);
+  /* 2026-10-22: abort only if a transfer is actually armed/in flight. From the completion callback the
+   * SPI is READY and HAL_SPI_Abort would only burn time (it waits on FIFO flush timeouts). */
+  if (hspi3.State != HAL_SPI_STATE_READY)
+    HAL_SPI_Abort(&hspi3);
 
   if (swap_tx_buf)
   {
@@ -430,8 +441,16 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 
   is_rx_buf_userspace_processed = false;
 
-  /* Preload buffers for next communication. */
-  dma_load(false);
+  /* 2026-10-22 (07.4.42.2 bench): SWAP AT COMPLETION. The old protocol re-armed the just-sent (now empty)
+   * buffer here and swapped in new data from the main loop (dma_load(true) + HAL_SPI_Abort) whenever it
+   * wanted to assert NIRQ — at an arbitrary moment relative to the master, which may be starting an
+   * exchange right then: the abort tore down a clocked transfer, both directions of it were lost, and the
+   * H7 loop stalled in the abort's FIFO-flush waits (heartbeat deltas: loop 103 iterations in 288 ms,
+   * 0 SPI errors, 0 frames either way). Now the only place a DMA is armed is here, right after an exchange
+   * ended, when the master is idle for >= X8H7_SPI_MIN_GAP_US (kernel side). The buffer armed is the one
+   * that accumulated data since the previous completion; NIRQ (main.c) is a pure "data waiting" signal.
+   * Cost: an H7->X8 item leaves one exchange later than before. */
+  dma_load(true);
 }
 
 /* 2026-10-22: SPI error-path prints go to the console UART (115200) from interrupt context — tens of

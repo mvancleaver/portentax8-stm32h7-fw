@@ -76,6 +76,7 @@ void smart_md_publish_response_done(void);
 bool is_nirq_low();
 bool is_ncs_low();
 uint16_t get_tx_packet_size();
+bool tx_data_pending(void);
 
 void dma_handle_data();
 
