@@ -213,6 +213,7 @@ typedef struct
 static x8h7_tx_pace_elem_t s_pace_ring[2][X8H7_TX_PACE_DEPTH];
 static volatile uint32_t s_pace_head[2], s_pace_tail[2];      /* consumer / producer indices (free-running) */
 static volatile uint32_t s_pace_last_tx_done_cyc[2];          /* DWT->CYCCNT at the last TX complete/abort */
+static volatile uint32_t s_pace_last_tx_done_ms[2];           /* HAL_GetTick() at the same instant (fallback clock) */
 static volatile uint8_t  s_pace_reply_seen[2];                /* an RX frame arrived since the last release */
 static volatile uint8_t  s_pace_hw_busy[2];                   /* a released request has not completed yet */
 static volatile uint32_t s_pace_released[2], s_pace_queued[2], s_pace_rejected[2];   /* diag counters */
@@ -224,7 +225,12 @@ static inline uint32_t pace_gap_cycles(void)
 
 static inline void pace_dwt_enable(void)
 {
+  /* Cortex-M7: DWT registers are write-protected until DWT->LAR is unlocked; main.c reads CYCCNT but
+   * nothing in this firmware ever enabled it (bench 2026-10-22: the gap clock never advanced, so a
+   * single missing reply wedged the pacer — a7bdda9 stalled TX completely). */
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->LAR          = 0xC5ACCE55u;
+  DWT->CYCCNT       = 0u;
   DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
@@ -252,7 +258,10 @@ static inline bool pace_may_release_locked(FDCAN_HandleTypeDef * handle, int con
   if (s_pace_released[k] == 0u) return true;                       /* first request ever */
   if (s_pace_reply_seen[k]) return true;                           /* the reply is in: bus is ours again */
   if (s_pace_hw_busy[k]) return false;                             /* TX-complete not yet seen: gap clock not started */
-  return (DWT->CYCCNT - s_pace_last_tx_done_cyc[k]) >= pace_gap_cycles();
+  if ((DWT->CYCCNT - s_pace_last_tx_done_cyc[k]) >= pace_gap_cycles()) return true;
+  /* Belt and braces: never depend on the cycle counter alone — a 2 ms tick fallback guarantees progress
+   * (a dead motor costs at most 2 ms per request instead of wedging the whole bus). */
+  return (HAL_GetTick() - s_pace_last_tx_done_ms[k]) >= 2u;
 }
 
 /* Release the next queued request if pacing allows. Safe from ISR and main loop. */
@@ -274,6 +283,7 @@ static inline void pace_on_tx_done(FDCAN_HandleTypeDef * handle)
 {
   int const k = (handle == &fdcan_1) ? 0 : 1;
   s_pace_last_tx_done_cyc[k] = DWT->CYCCNT;
+  s_pace_last_tx_done_ms[k]  = HAL_GetTick();
   s_pace_hw_busy[k] = 0u;
 }
 
@@ -320,6 +330,7 @@ void fdcan_tx_accounting_reset(FDCAN_HandleTypeDef * handle)
   s_pace_hw_busy[k] = 0; s_pace_reply_seen[k] = 0;
   s_pace_released[k] = 0; s_pace_queued[k] = 0; s_pace_rejected[k] = 0;
   s_pace_last_tx_done_cyc[k] = DWT->CYCCNT;
+  s_pace_last_tx_done_ms[k]  = HAL_GetTick();
   __set_PRIMASK(primask_bit);
 }
 
