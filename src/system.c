@@ -353,6 +353,7 @@ void dma_init()
 
 extern SPI_HandleTypeDef hspi3;
 
+volatile uint32_t s_dma_load_failures = 0;
 void dma_load(bool const swap_tx_buf)
 {
   HAL_SPI_Abort(&hspi3);
@@ -371,7 +372,10 @@ void dma_load(bool const swap_tx_buf)
 
   HAL_StatusTypeDef const rc = HAL_SPI_TransmitReceive_DMA(&hspi3, tx_buf, rx_buf, SPI_DMA_BUFFER_SIZE);
   if (rc != HAL_OK) {
+    s_dma_load_failures++;   /* 2026-10-22: counted, not printed (console UART print = tens of ms stall) */
+#ifdef DEBUG
     dbg_printf("HAL_SPI_TransmitReceive_DMA failed with %d, spi error code = 0x%lX\n", rc, HAL_SPI_GetError(&hspi3));
+#endif
   }
 }
 
@@ -430,9 +434,17 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
   dma_load(false);
 }
 
+/* 2026-10-22: SPI error-path prints go to the console UART (115200) from interrupt context — tens of
+ * milliseconds with everything else stalled. Count instead; keep the text under DEBUG only. */
+volatile uint32_t s_spi_error_callbacks = 0;
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
+  s_spi_error_callbacks++;
+#ifdef DEBUG
   dbg_printf("HAL_SPI_ErrorCallback: spi error code = 0x%lX\n", HAL_SPI_GetError(hspi));
+#else
+  (void)hspi;
+#endif
 
   /* Phase 07.4.14 patch 0054 (A4, RESEARCH §2.4 LATENT BUG fix): error paths
    * MUST clear tx_pkt state too. Pre-fix this leaked stranded TX state. */

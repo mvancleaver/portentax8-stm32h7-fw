@@ -91,6 +91,21 @@ static volatile uint32_t s_nirq_gate_both_low               = 0;
 static volatile uint32_t s_nirq_gate_unexpected             = 0;
 static volatile uint32_t s_nirq_gate_no_tx_packet           = 0;
 
+/* 2026-10-22 (07.4.42.2 bench, 600 s prodmix FAIL at +108 s): NIRQ handshake self-heal.
+ * The H7 asserts NIRQ LOW once (below) and only releases it after the X8's exchange has been
+ * processed (dma_handle_data). If the i.MX8 misses that falling edge (sub-us re-pulse race, A6)
+ * the H7 waits forever with a swapped TX buffer armed; the X8 only rescues it with an exchange of
+ * its own, and when its TX ring is full waiting for the TX_COMPLETE stuck in that very buffer
+ * nothing moves until the 50 ms netdev watchdog ("TX stalled (lost H7 status?)"). Here: if NIRQ
+ * has been LOW for X8H7_NIRQ_REPULSE_US with TX data pending and nCS never went LOW (no exchange
+ * started), re-pulse NIRQ (HIGH >= 5 us, then LOW) to regenerate the edge. Harmless if the X8 was
+ * merely late (IRQF_ONESHOT: a second edge while its thread runs is ignored). Counted. */
+#ifndef X8H7_NIRQ_REPULSE_US
+#define X8H7_NIRQ_REPULSE_US 500u
+#endif
+static volatile uint32_t s_nirq_low_at_cycles   = 0;   /* DWT->CYCCNT when we last pulled NIRQ low */
+static volatile uint32_t s_nirq_repulse_total   = 0;   /* re-pulses issued */
+
 /**************************************************************************************
  * FUNCTION DEFINITION
  **************************************************************************************/
@@ -182,6 +197,22 @@ void handle_data()
       dma_load(true);
       set_nirq_low();
       s_nirq_high_at_cycles = 0;
+      s_nirq_low_at_cycles  = DWT->CYCCNT;
+    }
+    else if (is_nirq_low() && !is_ncs_low() && (get_tx_packet_size() > 0 || s_nirq_low_at_cycles != 0))
+    {
+      /* NIRQ asserted, X8 has not started an exchange: after X8H7_NIRQ_REPULSE_US regenerate the edge. */
+      uint32_t const cycles_per_us = SystemCoreClock / 1000000u;
+      if (s_nirq_low_at_cycles != 0 &&
+          (DWT->CYCCNT - s_nirq_low_at_cycles) > (X8H7_NIRQ_REPULSE_US * cycles_per_us))
+      {
+        set_nirq_high();
+        uint32_t const t0 = DWT->CYCCNT;
+        while ((DWT->CYCCNT - t0) < (5u * cycles_per_us)) { /* >= 5 us HIGH (patch 0056 minimum) */ }
+        set_nirq_low();
+        s_nirq_low_at_cycles = DWT->CYCCNT;
+        s_nirq_repulse_total++;
+      }
     }
 
     /* Exit critical section: restore previous priority mask */
