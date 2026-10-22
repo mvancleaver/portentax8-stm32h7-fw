@@ -200,7 +200,7 @@ static volatile uint32_t s_rx_lost[2], s_rx_lost_reported[2];
  * kept for the (now unreachable) case of a full hardware FIFO.
  * ------------------------------------------------------------------------------------------ */
 #ifndef X8H7_TX_PACE_GAP_US
-#define X8H7_TX_PACE_GAP_US 150u
+#define X8H7_TX_PACE_GAP_US 500u   /* bench 2026-10-22: 150 us released the next request before a ~140-250 us reply and lost it; 500 us only matters for a motor that never answers */
 #endif
 #define X8H7_TX_PACE_DEPTH 32u
 typedef struct
