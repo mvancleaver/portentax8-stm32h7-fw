@@ -58,7 +58,8 @@
 #define X8H7_CAN_STS_INT_ERR               0x04
 #define X8H7_CAN_STS_INT_TX_ABORT_COMPLETE 0x08
 #define X8H7_CAN_STS_INT_TX_FIFO_EMPTY     0x10
-#define X8H7_CAN_STS_INT_HEARTBEAT         0x20  /* 2026-10-22 diag: {0x20, seq, loop8, txsub8, txrep8, rxfr8, repulse8, spierr8} every 100 ms */
+#define X8H7_CAN_STS_INT_HEARTBEAT         0x20  /* 2026-10-22 diag heartbeat every 100 ms; v4 (07.4.42.4): 39 B = v2 counters + v3 boot report + flags byte 38, sent from boot */
+#define X8H7_HB_FLAG_CAN2_INIT             0x01u /* 07.4.42.4 D-01: heartbeat v4 byte 38 bit0 = FDCAN2 initialised */
 
 /* Phase 07.4.5 (patch 0036) — compile-gate the Phase 06.2 Plan 03c H7-T5/T6
  * OPCODE_TRACE emits.  These debug traces fire on every FDCAN TX completion
@@ -332,17 +333,19 @@ int can_handle_data()
   /* 2026-10-22 diag heartbeat (FDCAN2 status channel, 8 B every 100 ms): lets the kernel tell an H7 that
    * stopped iterating from an H7 that iterates but sees no bus traffic. Costs 12 B / 100 ms of SPI payload. */
   s_hb_loops++;
-  if (is_can2_init && (uint32_t)(now - s_hb_last_ms) >= 100u)
+  /* 07.4.42.4 D-01: emitted from boot regardless of CAN init, so the X8 sees an H7 reboot (boot counter change) and can
+   * re-run CAN_INIT without an ip link down/up; the counters below are plain counters and touch no HAL handle. */
+  if ((uint32_t)(now - s_hb_last_ms) >= 100u)
   {
     /* v2 (16-bit counters; 8-bit ones wrapped within one 100 ms period): little-endian u16 fields */
     uint16_t const f[5] = { (uint16_t)s_hb_loops, (uint16_t)s_spi_error_callbacks, (uint16_t)s_rx_frames[1],
                             (uint16_t)s_tx_submitted[1], (uint16_t)s_nirq_repulse_total };
-    /* v3 (2026-10-22): + boot report tail {reset_cause16, fault_kind8, last_stage8, pc32, lr32, cfsr32, hfsr32,
-     * addr32, boot_count16} = 26 B (constant for the life of this boot; the kernel prints it when boot_count changes). */
+    /* v3/v4 (2026-10-22 / 07.4.42.4): + boot report tail {reset_cause16, fault_kind8, last_stage8, pc32, lr32, cfsr32, hfsr32,
+     * addr32, boot_count16, flags8} = 27 B (constant for the life of this boot; the kernel prints it when boot_count changes). */
     struct crash_record const *cr = crash_diag_last_fault();
     uint16_t const rc16 = crash_diag_reset_cause(), bc16 = crash_diag_boot_count();
     uint32_t const w[5] = { cr->pc, cr->lr, cr->cfsr, cr->hfsr, cr->addr };
-    uint8_t hb[38] = { X8H7_CAN_STS_INT_HEARTBEAT, s_hb_seq,
+    uint8_t hb[39] = { X8H7_CAN_STS_INT_HEARTBEAT, s_hb_seq,
                        (uint8_t)f[0], (uint8_t)(f[0] >> 8), (uint8_t)f[1], (uint8_t)(f[1] >> 8),
                        (uint8_t)f[2], (uint8_t)(f[2] >> 8), (uint8_t)f[3], (uint8_t)(f[3] >> 8),
                        (uint8_t)f[4], (uint8_t)(f[4] >> 8),
@@ -350,6 +353,7 @@ int can_handle_data()
     for (int i = 0; i < 5; i++) { hb[16 + 4 * i] = (uint8_t)w[i]; hb[17 + 4 * i] = (uint8_t)(w[i] >> 8);
                                   hb[18 + 4 * i] = (uint8_t)(w[i] >> 16); hb[19 + 4 * i] = (uint8_t)(w[i] >> 24); }
     hb[36] = (uint8_t)bc16; hb[37] = (uint8_t)(bc16 >> 8);
+    hb[38] = is_can2_init ? X8H7_HB_FLAG_CAN2_INIT : 0u;
     if (enqueue_packet(PERIPH_FDCAN2, CAN_STATUS, sizeof(hb), hb)) { s_hb_seq++; s_hb_last_ms = now; }
   }
 
